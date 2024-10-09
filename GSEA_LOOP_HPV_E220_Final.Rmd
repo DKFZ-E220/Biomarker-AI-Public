@@ -1,0 +1,308 @@
+---
+title: "GSEA_LOOP_HPV_E220_Final"
+author: Safayat Mahmud Khan
+output: html_document
+date: "2023-10-14"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# File input with msigdb categories 
+
+### ( Change the function settings if necessary). If you don't need all the categories, you can also edit it.
+
+```{r include=FALSE}
+library(clusterProfiler)
+library(enrichplot)
+library(DOSE)
+library(org.Hs.eg.db)
+library(msigdbr)
+library(dplyr)
+library(GSEAmining)
+library(GSEABase)
+# List of input files (replace with your actual file names)
+input_files <- c("put your deseq2 output files here")
+
+# Load OrgDb for humans
+human_orgdb <- org.Hs.eg.db
+
+# Specify the categories you want to analyze
+categories_to_analyze <- c("C5","H") 
+
+# Function to perform GSEA for a specific category and input file
+perform_gsea <- function(category, input_data) {
+  lfc_vector_c <- input_data$log2FoldChange
+  names(lfc_vector_c) <- input_data$gene_symbol
+  lfc_vector_c <- sort(lfc_vector_c, decreasing = TRUE)
+  
+  set.seed(2020)
+  
+  tryCatch({
+    gsea_result <- GSEA(geneList = lfc_vector_c,
+                        TERM2GENE = dplyr::select(category, gs_name, gene_symbol),
+                        minGSSize = 10, # Minimum gene set size
+                        maxGSSize = 1000, # Maximum gene set size
+                        seed = TRUE,
+                        pvalueCutoff = 0.05, # p-value cutoff
+                        pAdjustMethod = "BH" # Benjamini-Hochberg correction
+    )
+    return(gsea_result)
+  }, error = function(e) {
+    return(NULL) # Return NULL for failed analyses
+  })
+}
+
+# Create a list to store GSEA results for each category and each input file
+all_results_list <- list()
+
+# Perform GSEA analysis for each category and each input file
+for (category_name in categories_to_analyze) {
+  # Find the category data frame that matches the category name
+  category <- msigdbr(species = "Homo sapiens", category_name)
+  
+  if (!is.null(category)) {
+    category_results <- list()
+    
+    for (input_file in input_files) {
+      data <- read.csv(input_file)
+      gsea_result <- perform_gsea(category, data)
+      category_results[[input_file]] <- gsea_result
+    }
+    
+    all_results_list[[category_name]] <- category_results
+  } else {
+    print(paste("Category not found:", category_name))
+  }
+}
+
+# Function to get a GSEA result data frame from all_results_list based on category name and input file name
+get_gsea_result <- function(category_name, input_file) {
+  # Construct the name of the list element
+  result_name <- paste0("gsea_results_", category_name, "_", tools::file_path_sans_ext(basename(input_file)))
+  
+  # Retrieve the GSEA result data frame from all_results_list
+  gsea_result <- all_results_list[[category_name]][[input_file]]
+  
+  # Check if the result is NULL (i.e., the GSEA analysis failed for this category and input file)
+  if (is.null(gsea_result)) {
+    warning(paste("No GSEA result found for category", category_name, "and input file", input_file))
+    return(NULL)
+  }
+  
+  return(as.data.frame(gsea_result))
+}
+
+# Define the results directory
+results_directory <- "GSEAresults_loopcode"
+
+# Check if the directory exists, if not, create it
+if (!file.exists(results_directory)) {
+  dir.create(results_directory, showWarnings = FALSE)
+}
+# Save GSEA results data frames to files for each category and each input file (optional)
+for (category_name in names(all_results_list)) {
+  category_results <- all_results_list[[category_name]]
+  
+  for (i in seq_along(input_files)) {
+    input_file <- input_files[i]
+    result <- category_results[[input_file]]
+    
+    if (!is.null(result)) {
+      output_file <- file.path(results_directory, paste0("gsea_results_", category_name, "_", tools::file_path_sans_ext(basename(input_file)), ".csv"))
+      write.csv(as.data.frame(result), file = output_file, row.names = FALSE)
+    }
+  }
+}
+
+# New function to save merged GSEA results per input file
+save_merged_results <- function(all_results, input_file) {
+  merged_results <- data.frame()
+  for (category_name in names(all_results)) {
+    result <- all_results[[category_name]][[input_file]]
+    if (!is.null(result) && nrow(result) > 0) {
+      result_df <- as.data.frame(result)
+      result_df$Category <- category_name
+      merged_results <- rbind(merged_results, result_df)
+    }
+  }
+  # Define directory and file names
+  input_file_directory <- file.path("GSEAresults_loopcode", tools::file_path_sans_ext(basename(input_file)))
+  dir.create(input_file_directory, recursive = TRUE, showWarnings = FALSE)
+  output_file <- file.path(input_file_directory, "merged_GSEA_results.csv")
+  
+  # Write merged results to CSV
+  write.csv(merged_results, file = output_file, row.names = FALSE)
+  
+  # Save merged GSEA results object
+  saveRDS(merged_results, file = file.path(input_file_directory, "merged_GSEA_results.rds"))
+}
+
+# Now loop through each input file to save merged GSEA results
+for (input_file in input_files) {
+  save_merged_results(all_results_list, input_file)
+}
+
+
+```
+
+
+# Create dotplots 
+
+
+
+```{r echo=TRUE}
+# Load necessary libraries
+library(ggplot2)
+
+# Create base directories
+dir.create(file.path(results_directory, "doseplots"), showWarnings = FALSE, recursive = TRUE)
+
+# Updated save_plots function
+save_plots <- function(plots_list, base_directory, category_name, input_file_name, width = 10, height = 8) {
+  # Create category directory
+  category_directory <- file.path(base_directory, category_name)
+  dir.create(category_directory, showWarnings = FALSE)
+  
+  # Create input file directory
+  input_file_directory <- file.path(category_directory, input_file_name)
+  dir.create(input_file_directory, showWarnings = FALSE)
+  
+  # Iterate over each plot in the list and save it
+  for (geneSetID in names(plots_list)) {
+    plot <- plots_list[[geneSetID]]
+    
+    # Define the file name
+    file_name_base <- file.path(input_file_directory, geneSetID)
+    
+    # Save in PDF and PNG formats with specified dimensions
+    ggsave(paste0(file_name_base, ".pdf"), plot, width = width, height = height)
+    ggsave(paste0(file_name_base, ".png"), plot, width = width * 100, height = height * 100, units = "px")
+  }
+}
+
+# Loop through each category and input file
+for (category_name in names(all_results_list)) {
+  category_results <- all_results_list[[category_name]]
+  
+  for (input_file in input_files) {
+    result <- category_results[[input_file]]
+    
+    if (!is.null(result) && nrow(result) > 0) {  # Check if result is not null and has rows
+      
+      input_file_name <- tools::file_path_sans_ext(basename(input_file))
+      
+      # Doseplot with custom title that includes category and input file name
+      dose_plot <- dotplot(result, showCategory=15, split=".sign", font.size=8) + facet_grid(.~.sign) +
+                   ggtitle(paste("Category:", category_name, "| Input File:", input_file_name))  # Add title
+      
+      # Determine the NES sign presence in the result
+      has_positive_nes <- any(result$NES > 0)
+      has_negative_nes <- any(result$NES < 0)
+      
+      # Apply facet_grid only if both positive and negative NES values are present
+      if (has_positive_nes && has_negative_nes) {
+        dose_plot <- dose_plot + facet_grid(.~.sign)
+      }
+      
+      # Print the plot to show it in the knitted output
+      print(dose_plot)
+      
+      # Save the plot to the directory
+      dose_plot_list <- list(dose_plot = dose_plot)  # Wrap the dose plot in a list to be compatible with save_plots function
+      save_plots(dose_plot_list, file.path(results_directory, "doseplots"), category_name, input_file_name)
+    }
+  }
+}
+
+```
+
+# code with enriched and dendoplot but still the text sizes need to be changed. This code will sometimes generate error when it doesn't find enough dendograms. I couldn't fix it, as the package is not so well defined. Still, it's good if you want to see overall summary in the enriched plots. You can ignore it.
+
+```{r eval=FALSE, include=FALSE}
+# Function to generate plots
+generate_plots <- function(data, input_file_directory) {
+  
+   #Generate dendrogram plot
+  png(filename = file.path(input_file_directory, "dendrogram_plot.png"))
+  gm_dendplot(data$gs_filtered, data$gs_clustered)
+  dev.off()
+  
+   #Save dendrogram plot to PDF as well
+  pdf(file = file.path(input_file_directory, "dendrogram_plot.pdf"))
+  gm_dendplot(data$gs_filtered, data$gs_clustered)
+  dev.off()
+  
+  # Generate enriched terms plot
+  enriched_terms_plot <- gm_enrichterms(data$gs_filtered, data$gs_clustered)
+  
+  # Generate enrichment cores plot
+  enrichment_cores_plot <- gm_enrichcores(data$gs_filtered, data$gs_clustered)
+  
+  # Save individual plots (if they are ggplot objects)
+  if ("gg" %in% class(enriched_terms_plot) || "ggplot" %in% class(enriched_terms_plot))
+    ggsave(filename = file.path(input_file_directory, "enriched_terms_plot.png"), plot = enriched_terms_plot)
+  if ("gg" %in% class(enrichment_cores_plot) || "ggplot" %in% class(enrichment_cores_plot))
+    ggsave(filename = file.path(input_file_directory, "enrichment_cores_plot.png"), plot = enrichment_cores_plot)
+  
+  # Save plots in PDF format
+  if (!is.null(enriched_terms_plot)) {
+    pdf(file = file.path(input_file_directory, "enriched_terms_plot.pdf"))
+    print(enriched_terms_plot)
+    dev.off()
+  }
+  
+  if (!is.null(enrichment_cores_plot)) {
+    pdf(file = file.path(input_file_directory, "enrichment_cores_plot.pdf"))
+    print(enrichment_cores_plot)
+    dev.off()
+  }
+}
+
+
+
+
+# Loop through each input file
+for (input_file in input_files) {
+  
+  # Use tryCatch to handle errors and continue to the next file
+  tryCatch({
+    
+    # Define the directory and file names
+    input_file_directory <- file.path("GSEAresults_loopcode", tools::file_path_sans_ext(basename(input_file)))
+    merged_results_file <- file.path(input_file_directory, "merged_GSEA_results.csv")
+    
+    # Load the merged GSEA results
+    merged_results <- read.csv(merged_results_file)
+    
+    # Assume that you have filtered and clustered your data
+    # Replace the following line with your actual code for filtering and clustering
+    gs_data <- list(gs_filtered = gm_filter(merged_results), gs_clustered = gm_clust(gm_filter(merged_results)))
+    
+    # Check if the filtered data is empty
+    if (nrow(gs_data$gs_filtered) == 0) {
+      message(paste("No significant pathways for", input_file, ". Skipping this file."))
+      next
+    }
+    
+    # Generate and save the plots
+    generate_plots(gs_data, input_file_directory)
+    
+  }, error = function(e) {
+    # If an error occurs, print a message and continue to the next file
+    message(paste("Error processing", input_file, ": ", e$message, ". Continuing to the next file."))
+  })
+  
+}
+
+
+
+```
+
+
+
+
+
+
+
