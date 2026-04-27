@@ -1,0 +1,89 @@
+---
+title: "Intersect preclinical (untreated) and TCGA differential methylation results"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# Inputs are RnBeads differential-methylation tables:
+#   - from 04_tcga_methylation/01_rnbeads_tcga.R
+#   - from 02_preclinical_methylation/01_rnbeads_hpv.R
+source(here::here("config.R"))
+library(dplyr)
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+tcga_promoter        <- read.csv(file.path(TCGA_METH_OUT,    "tcga_diffMethTable_region_cmp1_promoters.csv"))
+tcga_genes           <- read.csv(file.path(TCGA_METH_OUT,    "tcga_diffMethTable_region_cmp1_genes.csv"))
+untreated_promoters  <- read.csv(file.path(PRECLIN_METH_OUT, "untreated_diffMethTable_region_cmp1_promoters.csv"))
+untreated_genes      <- read.csv(file.path(PRECLIN_METH_OUT, "untreated_diffMethTable_region_cmp1_genes.csv"))
+
+# Remove rows with NA in the symbol column
+tcga_promoter        <- tcga_promoter       %>% filter(!is.na(symbol))
+tcga_genes           <- tcga_genes          %>% filter(!is.na(symbol))
+untreated_promoters  <- untreated_promoters %>% filter(!is.na(symbol))
+untreated_genes      <- untreated_genes     %>% filter(!is.na(symbol))
+```
+
+# Filtration
+```{r}
+# Filter function for comb.p.adj.fdr
+filter_by_fdr <- function(df) {
+  df %>% filter(comb.p.adj.fdr < 0.5)
+}
+
+# Filter function for mean.mean.diff
+filter_by_mean_diff <- function(df) {
+  df %>% filter(mean.mean.diff > 0.2 | mean.mean.diff < -0.2)
+}
+
+# Apply the filters
+filtered_tcga_promoter        <- filter_by_fdr(tcga_promoter)
+filtered_tcga_genes           <- filter_by_fdr(tcga_genes)
+filtered_untreated_promoters  <- filter_by_fdr(untreated_promoters)
+filtered_untreated_genes      <- filter_by_fdr(untreated_genes)
+
+final_tcga_promoter           <- filter_by_mean_diff(filtered_tcga_promoter)
+final_tcga_genes              <- filter_by_mean_diff(filtered_tcga_genes)
+final_untreated_promoters     <- filter_by_mean_diff(filtered_untreated_promoters)
+final_untreated_genes         <- filter_by_mean_diff(filtered_untreated_genes)
+```
+
+
+# Write files
+```{r}
+write.csv(final_tcga_promoter,          file.path(PRECLIN_METH_OUT, "final_tcga_promoter.csv"),          row.names = FALSE)
+write.csv(final_tcga_genes,             file.path(PRECLIN_METH_OUT, "final_tcga_genes.csv"),             row.names = FALSE)
+write.csv(final_untreated_promoters,    file.path(PRECLIN_METH_OUT, "final_untreated_promoters.csv"),    row.names = FALSE)
+write.csv(final_untreated_genes,        file.path(PRECLIN_METH_OUT, "final_untreated_genes.csv"),        row.names = FALSE)
+write.csv(filtered_tcga_promoter,       file.path(PRECLIN_METH_OUT, "filtered_tcga_promoters.csv"),      row.names = FALSE)
+write.csv(filtered_tcga_genes,          file.path(PRECLIN_METH_OUT, "filtered_tcga_genes.csv"),          row.names = FALSE)
+write.csv(filtered_untreated_promoters, file.path(PRECLIN_METH_OUT, "filtered_untreated_promoters.csv"), row.names = FALSE)
+```
+
+# Top 500 genes from filtered file
+```{r}
+# Filter function for top 500 by combinedRank
+filter_top_500 <- function(df) {
+  df %>% arrange(combinedRank) %>% slice(1:500)
+}
+
+# Apply the filters
+filtered_tcga_promoter_top500 <- filter_by_fdr(tcga_promoter) %>%
+  filter_top_500()
+
+filtered_tcga_genes_top500 <- filter_by_fdr(tcga_genes) %>%
+  filter_top_500()
+
+filtered_untreated_promoters_top500 <- filter_by_fdr(untreated_promoters) %>%
+  filter_top_500()
+
+filtered_untreated_genes_top500 <- filter_by_fdr(untreated_genes) %>%
+  filter_top_500()
+
+# Write the filtered dataframes to CSV files
+write.csv(filtered_tcga_promoter_top500,       file.path(PRECLIN_METH_OUT, "filtered_tcga_promoter_top500.csv"),       row.names = FALSE)
+write.csv(filtered_tcga_genes_top500,          file.path(PRECLIN_METH_OUT, "filtered_tcga_genes_top500.csv"),          row.names = FALSE)
+write.csv(filtered_untreated_promoters_top500, file.path(PRECLIN_METH_OUT, "filtered_untreated_promoters_top500.csv"), row.names = FALSE)
+write.csv(filtered_untreated_genes_top500,     file.path(PRECLIN_METH_OUT, "filtered_untreated_genes_top500.csv"),     row.names = FALSE)
+```

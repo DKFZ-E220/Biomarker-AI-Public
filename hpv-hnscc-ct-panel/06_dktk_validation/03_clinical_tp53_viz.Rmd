@@ -1,0 +1,788 @@
+---
+title: "DKTK-ROG validation: clinical features, TP53 and visualisations"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# Clinical / demographic summary of the DKTK-ROG cohort, TP53 mutation and
+# p53 IHC correlations with HPV status and CT-panel clusters, plus the
+# accompanying visualisation figures. Inputs: DKTK_DATA; outputs: DKTK_OUT.
+source(here::here("config.R"))
+knitr::opts_chunk$set(fig.width = 14, fig.height = 8)
+library(oligo)
+library(biomaRt)
+library(dplyr)
+library(pheatmap)
+library(ggplot2)
+library(reshape2)
+library(readxl)
+library(tidyr)
+library(tableone)
+library(gridExtra)
+library(UpSetR)
+library(grid)
+library(rstatix)
+library(data.table)
+library(survival)
+library(survminer)
+library(purrr)
+```
+
+# Load and preprocess expression data
+
+```{r}
+load(file = file.path(DKTK_DATA, "datarma.rda"))
+boxplot(exprs(data.rma))
+```
+
+```{r}
+probesets <- rownames(data.rma) 
+probesets.corr <- gsub("\\.1", "", probesets)
+rownames(data.rma) <- probesets.corr
+fData(data.rma) <- as.data.frame(probesets.corr)
+```
+
+```{r}
+ensembl <- biomaRt::useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+annotLookup <- biomaRt::getBM(attributes = c("affy_hta_2_0",
+                              "ensembl_gene_id",
+                              "external_gene_name"
+                            ),
+               filters = "with_affy_hta_2_0",
+               values = TRUE,
+               mart = ensembl) 
+```
+
+```{r}
+indicesLookup <- match(probesets.corr, annotLookup$affy_hta_2_0)
+indicesLookup <- data.frame(probesets.corr, annotLookup[indicesLookup,])
+
+indicesLookup$control <- ifelse(
+  is.na(indicesLookup$external_gene_name),
+  ifelse(grepl("(TC.*hg)", probesets.corr), 
+         FALSE, 
+         TRUE),
+  FALSE)
+
+data_dktk.final <- subset(data.rma, !indicesLookup$control)
+```
+
+```{r}
+fData(data_dktk.final) <- left_join(fData(data_dktk.final), indicesLookup[1:4])
+```
+
+```{r}
+result <- tibble(fData(data_dktk.final)$probesets.corr, 
+                 fData(data_dktk.final)$external_gene_name, 
+                 .name_repair = ~ c("Probeset", "External_gene_name"))
+result <- bind_cols(result, as_tibble(exprs(data_dktk.final)))
+
+format_sample_id <- function(id) {
+  prefix <- gsub("(DKTKRO1[ab])(\\d+)", "\\1", id)
+  num <- gsub("(DKTKRO1[ab])(\\d+)", "\\2", id)
+  num_padded <- stringr::str_pad(num, width = 3, pad = "0")
+  formatted_id <- paste0(prefix, num_padded)
+  return(formatted_id)
+}
+
+original_colnames <- colnames(result)
+new_colnames <- gsub("(.+)\\.CEL", "DKTKRO1\\1", original_colnames)
+formatted_colnames <- sapply(new_colnames, format_sample_id)
+colnames(result) <- formatted_colnames
+result <- result %>%
+  dplyr::rename(Probeset = ProbesetProbeset, External_gene_name = External_gene_nameExternal_gene_name)
+```
+
+```{r}
+data_dktk <- result
+data_dktk <- data_dktk %>% filter(External_gene_name != "")
+```
+
+```{r}
+data_dktk <- data.table::data.table(data_dktk)
+
+nondups <- data_dktk[!(
+  duplicated(data_dktk, by = "External_gene_name") | 
+    duplicated(data_dktk, fromLast = TRUE, by="External_gene_name")
+),]
+dups <- data_dktk[(
+  duplicated(data_dktk, by = "External_gene_name") | 
+                 duplicated(data_dktk, fromLast = TRUE, by="External_gene_name")
+),]
+
+log_median <- function(x) {
+  n <- length(x)
+  s <- sort(x)
+  r <- 0:1
+  ifelse(n %% 2 == 1, 
+         s[(n+1)/2], 
+         exp(median(log(s[n/2+r])))
+  )
+}
+
+patient_cols <- which(!(colnames(dups) %in% c("Probeset", "External_gene_name")))
+
+dups <- dups %>% 
+  group_by(External_gene_name) %>%
+  summarise_at(.vars = names(.)[patient_cols],
+               .funs = log_median)
+
+data_dktk <- rbind(nondups[,-1], dups)
+```
+
+# Load clinical data
+
+```{r}
+dktk_adjuvant <- read.csv(file.path(DKTK_DATA, "dktk_adjuvant.csv"), check.names = FALSE)
+
+samples <- colnames(data_dktk)[-1]
+
+dktk_adjuvant_microarray <- dktk_adjuvant %>%
+  filter(`Participant ID` %in% samples)
+```
+
+# Prepare expression and metadata
+
+```{r}
+metadata_adjuvant <- as.data.frame(dktk_adjuvant_microarray)
+rownames(metadata_adjuvant) <- metadata_adjuvant[,1]
+metadata_adjuvant <- metadata_adjuvant[, -1]
+
+data_adjuvant <- as.data.frame(data_dktk)
+rownames(data_adjuvant) <- data_adjuvant[,1]
+data_adjuvant <- data_adjuvant[,-1]
+
+common_row_names <- intersect(colnames(data_adjuvant), rownames(metadata_adjuvant))
+data_adjuvant <- data_adjuvant[, common_row_names]
+
+expression_data_adjuvant <- data.frame(lapply(data_adjuvant, as.numeric), row.names = rownames(data_adjuvant))
+expression_data_adjuvant_t <- t(expression_data_adjuvant)
+
+metadata_adjuvant <- metadata_adjuvant[match(colnames(expression_data_adjuvant), rownames(metadata_adjuvant)), ]
+```
+
+# K-means clustering
+
+```{r}
+final_gene <- c("RIBC2", "TCAM1P", "SMC1B", "STAG3", "SYCP2")
+
+scaled_patients <- scale(expression_data_adjuvant_t[, final_gene], center = TRUE, scale = TRUE)
+
+kmeans_clustering <- function(data) {
+  set.seed(42)
+  kmeans_result <- kmeans(data, centers = 3, nstart = 100, iter.max = 10, algorithm = "Hartigan-Wong")
+  cluster_means <- tapply(rowMeans(data), kmeans_result$cluster, mean)
+  
+  if (cluster_means[1] > cluster_means[2] && cluster_means[1] > cluster_means[3]) {
+    high <- 1; medium <- ifelse(cluster_means[2] > cluster_means[3], 2, 3); low <- ifelse(cluster_means[2] > cluster_means[3], 3, 2)
+  } else if (cluster_means[2] > cluster_means[1] && cluster_means[2] > cluster_means[3]) {
+    high <- 2; medium <- ifelse(cluster_means[1] > cluster_means[3], 1, 3); low <- ifelse(cluster_means[1] > cluster_means[3], 3, 1)
+  } else {
+    high <- 3; medium <- ifelse(cluster_means[1] > cluster_means[2], 1, 2); low <- ifelse(cluster_means[1] > cluster_means[2], 2, 1)
+  }
+  
+  cluster <- as.factor(kmeans_result$cluster)
+  levels(cluster)[high] <- "High CT Panel Expression"
+  levels(cluster)[medium] <- "Intermediate CT Panel Expression"
+  levels(cluster)[low] <- "Low CT Panel Expression"
+  
+  return(list(cluster_labels = cluster, centroids = kmeans_result$centers))
+}
+
+clustering_results <- kmeans_clustering(scaled_patients[, final_gene])
+expression_data_adjuvant_t <- as.data.frame(expression_data_adjuvant_t)
+expression_data_adjuvant_t <- tibble::rownames_to_column(expression_data_adjuvant_t, "Patient_ID")
+expression_data_adjuvant_t$DEG.kmeans <- clustering_results$cluster_labels
+```
+
+# Prepare data for clinical analysis
+
+```{r}
+LTC_adjuvant <- read.csv(file.path(DKTK_DATA, "adjuvant_merged.csv"))
+
+cluster <- cbind(scaled_patients[, final_gene], expression_data_adjuvant_t[, c("DEG.kmeans", "Patient_ID")])
+
+clusters_df <- data.frame(Participant.ID = rownames(cluster), 
+                          clusters_elastic_adjuvant = cluster[, "DEG.kmeans"])
+
+filtered_LTC_adjuvant <- LTC_adjuvant[LTC_adjuvant$Participant.ID %in% clusters_df$Participant.ID, ]
+
+selected_columns <- filtered_LTC_adjuvant[, c("Participant.ID", colnames(LTC_adjuvant)[14:19])]
+
+merged_df_elastic_adjuvant <- merge(clusters_df, selected_columns, by = "Participant.ID")
+
+# Prepare metadata_adjuvant_filtered from original metadata
+metadata_adjuvant$sample_id <- rownames(metadata_adjuvant)
+metadata_adjuvant_filtered <- metadata_adjuvant
+
+metadata_adjuvant_filtered$Participant.ID <- rownames(metadata_adjuvant_filtered)
+merged_with_metadata <- merge(merged_df_elastic_adjuvant,
+                              metadata_adjuvant_filtered,
+                              by = "Participant.ID")
+
+annets <- read.csv(file.path(DKTK_DATA, "tp53_status_dktk_adjuvant.csv"))
+merged_with_metadata <- merge(merged_with_metadata,
+                              annets[, c("Participant.ID", "TP53.status", "TP53.variant")],
+                              by = "Participant.ID", all.x = TRUE)
+
+merged_with_metadata <- merged_with_metadata %>%
+  mutate(TP53_variant_group = case_when(
+    is.na(TP53.variant) ~ NA_character_,
+    TP53.variant == "wt" ~ "WT",
+    grepl("fs$|\\*$", TP53.variant) ~ "Frameshift/Nonsense Mutation",
+    TRUE ~ "Missense Mutation"
+  ))
+
+merged_with_metadata <- merged_with_metadata %>%
+  mutate(across(c(P16, `HPV16 DNS`, `HPV16 RNA`), ~ ifelse(. == 1, "Positive", "Negative")))
+colnames(merged_with_metadata)[colnames(merged_with_metadata) == "HPV16 DNS"] <- "HPV16 DNA"
+
+merged_with_metadata <- merged_with_metadata %>%
+  mutate(
+    P16_Positive               = ifelse(P16 == "Positive", "Positive", "Negative"),
+    HPV16DNA_Positive          = ifelse(`HPV16 DNA` == "Positive", "Positive", "Negative"),
+    HPV16RNA_Positive          = ifelse(`HPV16 RNA` == "Positive", "Positive", "Negative"),
+    Double_P16_HPV16DNA        = ifelse(P16 == "Positive" & `HPV16 DNA` == "Positive", "Positive", "Negative"),
+    Double_P16_HPV16RNA        = ifelse(P16 == "Positive" & `HPV16 RNA` == "Positive", "Positive", "Negative"),
+    Double_HPV16DNA_HPV16RNA   = ifelse(`HPV16 DNA` == "Positive" & `HPV16 RNA` == "Positive", "Positive", "Negative"),
+    Triple_Positive            = ifelse(P16 == "Positive" & `HPV16 DNA` == "Positive" & `HPV16 RNA` == "Positive", "Positive", "Negative"),
+    Any_Positive               = ifelse(P16 == "Positive" | `HPV16 DNA` == "Positive" | `HPV16 RNA` == "Positive", "Positive", "Negative")
+  )
+```
+
+# Table One: Clinical characteristics
+
+```{r}
+# Rename columns for clarity (from original file)
+colnames(merged_with_metadata)[colnames(merged_with_metadata) == "clusters_elastic_adjuvant"] <- "K-means cluster"
+colnames(merged_with_metadata)[colnames(merged_with_metadata) == "HPV16 DNS"]            <- "HPV16 DNA"
+colnames(merged_with_metadata)[colnames(merged_with_metadata) == "T E1 C1"]              <- "Tumor stage"
+colnames(merged_with_metadata)[colnames(merged_with_metadata) == "Sex.x"]                <- "Gender"
+colnames(merged_with_metadata)[colnames(merged_with_metadata) == "AGE E1 C1"]            <- "Age"
+colnames(merged_with_metadata)[colnames(merged_with_metadata) == "LOCALISATION E1 C1"]   <- "Tumor localisation"
+colnames(merged_with_metadata)[colnames(merged_with_metadata) == "N E1 C1"]              <- "N status"
+colnames(merged_with_metadata)[colnames(merged_with_metadata) == "R E1 C1"]              <- "R status"
+colnames(merged_with_metadata)[colnames(merged_with_metadata) == "GRADING E1 C1"]        <- "Grading"
+colnames(merged_with_metadata)[colnames(merged_with_metadata) == "SUNCF TABACCO E3 C3"] <- "Smoking"
+colnames(merged_with_metadata)[colnames(merged_with_metadata) == "SUABUSE ALCOHOL E3 C3"] <- "Alcohol"
+colnames(merged_with_metadata)[colnames(merged_with_metadata) == "UICCSTATE E1 C1"]      <- "UICC status"
+colnames(merged_with_metadata)[colnames(merged_with_metadata) == "ECESTATE E1 C1"]       <- "ECE status"
+colnames(merged_with_metadata)[colnames(merged_with_metadata) == "1TSTDOSE E2 C2"]       <- "Chemotherapy dose (Gy)"
+
+# Standardize Gender values
+merged_with_metadata$Gender[merged_with_metadata$Gender == "f"] <- "Female"
+merged_with_metadata$Gender[merged_with_metadata$Gender == "m"] <- "Male"
+
+# Recode binary and categorical markers
+merged_with_metadata$P53[merged_with_metadata$P53 == 0] <- "Negative"
+merged_with_metadata$P53[merged_with_metadata$P53 == 1] <- "Positive"
+
+merged_with_metadata$`HPV16 RNA`[merged_with_metadata$`HPV16 RNA` == 0] <- "Negative"
+merged_with_metadata$`HPV16 RNA`[merged_with_metadata$`HPV16 RNA` == 1] <- "Positive"
+
+merged_with_metadata$`HPV16 DNA`[merged_with_metadata$`HPV16 DNA` == 0] <- "Negative"
+merged_with_metadata$`HPV16 DNA`[merged_with_metadata$`HPV16 DNA` == 1] <- "Positive"
+
+# Recode Tumor stage
+merged_with_metadata$`Tumor stage`[merged_with_metadata$`Tumor stage` == "0"] <- "Tx"
+merged_with_metadata$`Tumor stage`[merged_with_metadata$`Tumor stage` == "1"] <- "T0"
+merged_with_metadata$`Tumor stage`[merged_with_metadata$`Tumor stage` == "2"] <- "Tis"
+merged_with_metadata$`Tumor stage`[merged_with_metadata$`Tumor stage` == "3"] <- "T1"
+merged_with_metadata$`Tumor stage`[merged_with_metadata$`Tumor stage` == "4"] <- "T2"
+merged_with_metadata$`Tumor stage`[merged_with_metadata$`Tumor stage` == "5"] <- "T3"
+merged_with_metadata$`Tumor stage`[merged_with_metadata$`Tumor stage` == "6"] <- "T4"
+
+# Recode N status
+merged_with_metadata$`N status`[merged_with_metadata$`N status` == "0"] <- "Nx"
+merged_with_metadata$`N status`[merged_with_metadata$`N status` == "1"] <- "N0"
+merged_with_metadata$`N status`[merged_with_metadata$`N status` == "2"] <- "N1"
+merged_with_metadata$`N status`[merged_with_metadata$`N status` == "3"] <- "N2"
+merged_with_metadata$`N status`[merged_with_metadata$`N status` == "4"] <- "N2a"
+merged_with_metadata$`N status`[merged_with_metadata$`N status` == "5"] <- "N2b"
+merged_with_metadata$`N status`[merged_with_metadata$`N status` == "6"] <- "N2c"
+merged_with_metadata$`N status`[merged_with_metadata$`N status` == "7"] <- "N3"
+
+# Recode R status
+merged_with_metadata$`R status`[merged_with_metadata$`R status` == "0"] <- "Rx"
+merged_with_metadata$`R status`[merged_with_metadata$`R status` == "1"] <- "R0"
+merged_with_metadata$`R status`[merged_with_metadata$`R status` == "2"] <- "R1"
+merged_with_metadata$`R status`[merged_with_metadata$`R status` == "3"] <- "R2"
+
+# Recode Grading
+merged_with_metadata$`Grading`[merged_with_metadata$`Grading` == "0"] <- "Gx"
+merged_with_metadata$`Grading`[merged_with_metadata$`Grading` == "1"] <- "G1"
+merged_with_metadata$`Grading`[merged_with_metadata$`Grading` == "2"] <- "G2"
+merged_with_metadata$`Grading`[merged_with_metadata$`Grading` == "3"] <- "G3"
+merged_with_metadata$`Grading`[merged_with_metadata$`Grading` == "4"] <- "G4"
+
+# Recode UICC status
+merged_with_metadata$`UICC status`[merged_with_metadata$`UICC status` == "0"] <- "0"
+merged_with_metadata$`UICC status`[merged_with_metadata$`UICC status` == "1"] <- "I"
+merged_with_metadata$`UICC status`[merged_with_metadata$`UICC status` == "2"] <- "II"
+merged_with_metadata$`UICC status`[merged_with_metadata$`UICC status` == "3"] <- "III"
+merged_with_metadata$`UICC status`[merged_with_metadata$`UICC status` == "4"] <- "IV"
+merged_with_metadata$`UICC status`[merged_with_metadata$`UICC status` == "5"] <- "IVA"
+merged_with_metadata$`UICC status`[merged_with_metadata$`UICC status` == "6"] <- "IVB"
+merged_with_metadata$`UICC status`[merged_with_metadata$`UICC status` == "7"] <- "IVC"
+
+# Recode ECE status
+merged_with_metadata$`ECE status`[merged_with_metadata$`ECE status` == "0"] <- "No"
+merged_with_metadata$`ECE status`[merged_with_metadata$`ECE status` == "1"] <- "Yes"
+
+# Recode Smoking
+merged_with_metadata$`Smoking`[merged_with_metadata$`Smoking` == "0"] <- "Yes"
+merged_with_metadata$`Smoking`[merged_with_metadata$`Smoking` == "1"] <- "Ex-smoker since 1 Year"
+merged_with_metadata$`Smoking`[merged_with_metadata$`Smoking` == "2"] <- "No"
+merged_with_metadata$`Smoking`[merged_with_metadata$`Smoking` == "3"] <- "Unknown"
+
+# Recode Alcohol
+merged_with_metadata$`Alcohol`[merged_with_metadata$`Alcohol` == "0"] <- "Yes"
+merged_with_metadata$`Alcohol`[merged_with_metadata$`Alcohol` == "1"] <- "Non-Alcoholic since 1 Year"
+merged_with_metadata$`Alcohol`[merged_with_metadata$`Alcohol` == "2"] <- "No"
+merged_with_metadata$`Alcohol`[merged_with_metadata$`Alcohol` == "3"] <- "Unknown"
+
+# Filter to Any_Positive cohort
+final_merged_data <- merged_with_metadata %>%
+  filter(`Any_Positive` == "Positive")
+
+# Ensure Participant.ID exists
+if (!"Participant.ID" %in% colnames(final_merged_data)) {
+  final_merged_data$Participant.ID <- rownames(final_merged_data)
+}
+
+vars <- c("P53", "TP53.status", "TP53.variant", "HPV16 DNA", "HPV16 RNA", "P16",
+          "Gender", "Tumor stage", "Age", "Chemotherapy dose (Gy)", 
+          "Smoking", "Alcohol", "N status", "R status", "Grading", "UICC status", 
+          "ECE status")
+          
+categorical_vars <- c("P53", "Gender", "Tumor stage", "Smoking", 
+                      "Alcohol", "N status", "R status", "Grading", "UICC status", 
+                      "ECE status", "TP53.status", "HPV16 DNA", "HPV16 RNA", "P16")
+
+table1 <- CreateTableOne(vars = vars, 
+                         strata = "K-means cluster", 
+                         data = final_merged_data, 
+                         factorVars = categorical_vars)
+
+final_table <- as.data.frame(print(table1, showAllLevels = TRUE, quote = TRUE, noSpaces = TRUE))
+
+rownames(final_table) <- gsub("^X\\.|\\.+$", "", rownames(final_table))
+rownames(final_table) <- gsub("\\.+", " ", rownames(final_table))
+rownames(final_table) <- gsub("^\\d+\\s+", "", rownames(final_table))
+final_table$row_labels <- rownames(final_table)
+
+print(final_table)
+write.csv(final_table, file.path(DKTK_OUT, "table1_dktkadjuvant.csv"))
+```
+
+# TP53 correlation analysis
+
+```{r}
+# Define the gene-of-interest (GOI) list for TP53 correlations
+# Only significant CT panel genes from DEG analysis
+final_gene_extended <- c(
+  "TP53", "RIBC2", "STAG3", "SMC1B", "SYCP2", "TCAM1P", "MYO3A", 
+  "YBX2", "TAF7L", "ZNF541", "SYCE2", "SOX30", "ZCWPW1", "MAGEB2"
+)
+
+cor_strength <- function(r) {
+  a <- abs(r)
+  dplyr::case_when(
+    a < 0.3 ~ "Weak (<0.3)",
+    a < 0.6 ~ "Moderate (0.3–0.6)",
+    TRUE    ~ "Strong (>0.6)"
+  )
+}
+
+tp53_vs_all <- function(expr_mat, method = c("spearman", "pearson")) {
+  method <- match.arg(method)
+
+  stopifnot("TP53" %in% rownames(expr_mat))
+  genes <- rownames(expr_mat)
+
+  tp53_vec <- as.numeric(expr_mat["TP53", ])
+
+  res <- map_dfr(setdiff(genes, "TP53"), function(g) {
+    x <- tp53_vec
+    y <- as.numeric(expr_mat[g, ])
+
+    ok <- is.finite(x) & is.finite(y)
+    if (sum(ok) < 5) return(NULL)
+
+    ct <- suppressWarnings(stats::cor.test(x[ok], y[ok], method = method, exact = FALSE))
+
+    tibble(
+      Gene = g,
+      Correlation = unname(ct$estimate),
+      P_Value = ct$p.value
+    )
+  })
+
+  res %>%
+    mutate(
+      FDR = p.adjust(P_Value, method = "BH"),
+      Direction = ifelse(Correlation >= 0, "Positive", "Negative"),
+      Strength = cor_strength(Correlation),
+      Method = method
+    )
+}
+
+selected_dets <- c("Any", "P16", "HPV16DNA")
+
+tp53_all <- list()
+
+for (name in c("Any_Positive", "P16_Positive", "HPV16DNA_Positive")) {
+
+  md_sub <- final_merged_data %>% filter((!!sym(name)) == "Positive")
+  if (nrow(md_sub) < 10) next
+
+  common_samples <- intersect(md_sub$Participant.ID, colnames(expression_data_adjuvant))
+  if (length(common_samples) < 5) next
+
+  expr_sub <- expression_data_adjuvant[, common_samples, drop = FALSE]
+  # Include TP53 plus the extended CT panel genes
+  genes_to_use <- union("TP53", intersect(rownames(expr_sub), final_gene_extended))
+  expr_sub <- expr_sub[genes_to_use, , drop = FALSE]
+
+  if (!"TP53" %in% rownames(expr_sub)) next
+
+  det_name <- gsub("_Positive", "", name)
+  tp53_res <- tp53_vs_all(expr_sub, method = "spearman") %>%
+    mutate(Detection = det_name)
+
+  tp53_all[[det_name]] <- tp53_res
+}
+
+tp53_tbl <- bind_rows(tp53_all)
+if(nrow(tp53_tbl) == 0) {
+  cat("Warning: tp53_tbl is empty. Check that samples have been properly filtered.\n")
+}
+```
+
+# TP53 correlation plot
+
+```{r}
+if(nrow(tp53_tbl) > 0) {
+  tp53_tbl_plot <- tp53_tbl %>%
+    mutate(
+      Gene = reorder(Gene, Correlation),
+      signif = case_when(
+        FDR < 0.001 ~ "***",
+        FDR < 0.01  ~ "**",
+        FDR < 0.05  ~ "*",
+        TRUE        ~ ""
+      )
+    )
+
+  p <- ggplot(tp53_tbl_plot, aes(x = Correlation, y = Gene, fill = Strength)) +
+    geom_col(width = 0.75) +
+    geom_text(
+      aes(label = sprintf("%.2f", Correlation)),
+      hjust = ifelse(tp53_tbl_plot$Correlation >= 0, 1.1, -0.1),
+      color = "black",
+      size = 3.5
+    ) +
+    geom_text(
+      aes(label = signif),
+      hjust = ifelse(tp53_tbl_plot$Correlation >= 0, -0.2, 1.2),
+      size = 5,
+      fontface = "bold"
+    ) +
+    facet_wrap(~ Detection, nrow = 1) +
+    coord_cartesian(xlim = c(-1, 1), clip = "off") +
+    theme_minimal() +
+    theme(
+      legend.position = "top",
+      panel.grid.major.y = element_blank(),
+      plot.margin = margin(5.5, 20, 5.5, 5.5)
+    ) +
+    labs(
+      x = "Spearman correlation with TP53 (ρ)",
+      y = NULL,
+      fill = "Strength"
+    )
+
+  print(p)
+  write.csv(tp53_tbl, file.path(DKTK_OUT, "TP53_correlations_all_detections.csv"))
+} else {
+  cat("No TP53 correlations to plot - empty dataset\n")
+}
+```
+
+# Add gene expression to merged metadata
+
+```{r}
+gene_list <- c("TP53", "SMC1B", "STAG3", "SYCP2", "TCAM1P", "RIBC2")
+
+for(g in gene_list) {
+  if(g %in% rownames(expression_data_adjuvant)) {
+    merged_with_metadata[[g]] <- as.numeric(expression_data_adjuvant[g, merged_with_metadata$Participant.ID])
+  } else {
+    merged_with_metadata[[g]] <- NA
+  }
+}
+
+# Also add genes to final_merged_data
+for(g in gene_list) {
+  if(g %in% rownames(expression_data_adjuvant)) {
+    final_merged_data[[g]] <- as.numeric(expression_data_adjuvant[g, final_merged_data$Participant.ID])
+  } else {
+    final_merged_data[[g]] <- NA
+  }
+}
+
+print(head(merged_with_metadata[, c("Participant.ID", gene_list)]))
+```
+
+# TP53 expression by cluster
+
+```{r}
+final_merged_data$`K-means cluster` <- factor(
+  final_merged_data$`K-means cluster`,
+  levels = c("High CT Panel Expression", "Intermediate CT Panel Expression", "Low CT Panel Expression")
+)
+
+filtered_ct <- final_merged_data %>%
+  dplyr::filter(
+    !is.na(TP53),
+    !is.na(`K-means cluster`),
+    !is.na(P53),
+    !is.na(TP53_variant_group),
+    TP53_variant_group != "Unknown Mutation Status"
+  )
+
+p_tp53_all <- ggplot(filtered_ct,
+                     aes(x = `K-means cluster`, y = TP53, fill = `K-means cluster`)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.6, width = 0.5) +
+  geom_jitter(aes(color = TP53_variant_group), width = 0.2, size = 2, alpha = 0.8) +
+  facet_wrap(~ P53) +
+  labs(title = "TP53 Expression by CT Panel Group",
+       x = "CT Panel Group",
+       y = "TP53 Expression",
+       fill = "CT Panel Group",
+       color = "TP53 Variant Group") +
+  scale_fill_manual(values = c("High CT Panel Expression" = "#7AB2D3", 
+                               "Intermediate CT Panel Expression" = "#E7B800", 
+                               "Low CT Panel Expression" = "#DE3163")) +
+  theme_minimal() +
+  theme(text = element_text(size = 12),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(p_tp53_all)
+
+# Tukey HSD post-hoc test per P53 status
+get_tukey_one_facet <- function(df_one_p53) {
+  # Create clean helper column for stats
+  df_one_p53$K_means_cluster <- as.factor(df_one_p53$`K-means cluster`)
+  
+  if (dplyr::n_distinct(df_one_p53$K_means_cluster) < 2) return(tibble())
+
+  fit <- aov(TP53 ~ K_means_cluster, data = df_one_p53)
+  tk <- TukeyHSD(fit)$K_means_cluster
+
+  out <- as.data.frame(tk)
+  out$comparison <- rownames(out)
+
+  out %>%
+    as_tibble() %>%
+    separate(comparison, into = c("group1", "group2"), sep = "-", remove = TRUE) %>%
+    transmute(group1 = group1, group2 = group2, p.adj = `p adj`)
+}
+
+tukey_results_ct <- filtered_ct %>%
+  group_by(P53) %>%
+  group_modify(~ get_tukey_one_facet(.x)) %>%
+  ungroup() %>%
+  mutate(
+    p.adj.signif = case_when(
+      p.adj <= 0.0001 ~ "****",
+      p.adj <= 0.001  ~ "***",
+      p.adj <= 0.01   ~ "**",
+      p.adj <= 0.05   ~ "*",
+      TRUE            ~ "ns"
+    )
+  )
+
+max_tp53 <- filtered_ct %>%
+  group_by(P53) %>%
+  summarise(max_TP53 = max(TP53, na.rm = TRUE), .groups = "drop")
+
+tukey_results_ct <- tukey_results_ct %>%
+  left_join(max_tp53, by = "P53") %>%
+  group_by(P53) %>%
+  mutate(y.position = max_TP53 + seq(0.1, 0.1 * n(), length.out = n())) %>%
+  ungroup()
+
+p_tp53_all <- p_tp53_all +
+  stat_pvalue_manual(
+    tukey_results_ct,
+    label = "p.adj.signif",
+    y.position = "y.position",
+    tip.length = 0.02
+  )
+
+print(p_tp53_all)
+
+# Save plot
+ggsave(file.path(DKTK_OUT, "TP53_correlation_by_detection.pdf"), plot = p_tp53_all, width = 14, height = 10, units = "in")
+```
+
+# HPV detection and TP53 interaction plot
+
+```{r}
+library(scales)
+
+# 1) Define short labels for detection methods (simplified to 5 main categories)
+short_labs <- c(
+  Any_Positive                   = "Any+",
+  Triple_Positive                = "Triple+",
+  P16_Positive                   = "P16+",
+  HPV16DNA_Positive              = "DNA+",
+  HPV16RNA_Positive              = "RNA+"
+)
+
+# Pivot to long and compute variant/HPV interaction
+long_data3 <- final_merged_data %>%
+  dplyr::select(Participant.ID,
+         TP53_variant_group,
+         P53,
+         `K-means cluster`,
+         all_of(names(short_labs))) %>%
+  pivot_longer(
+    cols      = names(short_labs),
+    names_to  = "Detection_Method",
+    values_to = "HPV_Status"
+  ) %>%
+  filter(!is.na(HPV_Status)) %>%
+  mutate(
+    Detection_Short = short_labs[Detection_Method],
+    P53             = factor(P53,
+                             levels = c("Negative","Positive"),
+                             labels = c("P53–","P53+")),
+    `K-means cluster` = factor(`K-means cluster`,
+      levels = c("High CT Panel Expression",
+                 "Intermediate CT Panel Expression",
+                 "Low CT Panel Expression")
+    ),
+    Variant = case_when(
+      stringr::str_detect(TP53_variant_group, "WT")            ~ "WT",
+      stringr::str_detect(TP53_variant_group, "Missense")      ~ "Missense",
+      stringr::str_detect(TP53_variant_group, "Frameshift|Nonsense") ~ "Frameshift/Nonsense",
+      TRUE                                            ~ "Unknown"
+    ),
+    HPV_Status = factor(HPV_Status, levels = c("Positive","Negative")),
+    VarHPV = factor(
+      paste(Variant, HPV_Status, sep = "."),
+      levels = c(
+        "WT.Positive","WT.Negative",
+        "Missense.Positive","Missense.Negative",
+        "Frameshift/Nonsense.Positive","Frameshift/Nonsense.Negative",
+        "Unknown.Positive","Unknown.Negative"
+      )
+    )
+  )
+
+# Build 8-color palette
+base_cols <- c(
+  WT                     = "#2b8cbe",
+  Missense               = "#8856a7",
+  `Frameshift/Nonsense`  = "#41b6c4",
+  Unknown                = "#000000"
+)
+pal <- setNames(
+  sapply(levels(long_data3$VarHPV), function(lvl) {
+    parts <- strsplit(lvl, "\\.")[[1]]
+    col   <- base_cols[parts[1]]
+    if (parts[2] == "Negative") col <- scales::alpha(col, 0.4)
+    col
+  }),
+  levels(long_data3$VarHPV)
+)
+
+# Horizontal bar plot
+p_final_axis <- ggplot(long_data3, aes(x = Detection_Short, fill = VarHPV)) +
+  geom_bar(position = "stack", color = "black", size = 0.2) +
+  facet_grid(`K-means cluster` ~ P53, switch = "x") +
+  coord_flip() +
+  scale_fill_manual(values = pal,
+                    name   = "TP53 var · HPV",
+                    drop   = FALSE) +
+  scale_y_continuous(
+    expand = expansion(mult = c(0, 0.05)),
+    breaks = pretty_breaks(n = 5)
+  ) +
+  labs(
+    x     = NULL,
+    y     = "Number of patients",
+    title = "HPV detection methods × TP53 variants,\nby CT-panel & P53 stain"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    strip.placement    = "outside",
+    strip.text.x       = element_text(size = 12, face = "bold"),
+    strip.text.y       = element_text(size = 12, face = "bold"),
+    axis.text.y        = element_text(size = 10, colour = "black"),
+    axis.text.x        = element_text(size = 12, colour = "black"),
+    panel.grid.major.y = element_blank(),
+    legend.position    = "bottom",
+    plot.margin        = margin(t = 10, r = 50, b = 10, l = 10)  # Add right margin to prevent cutoff
+  )
+
+print(p_final_axis)
+
+# Save HPV interaction plot
+ggsave(file.path(DKTK_OUT, "HPV_detection_TP53_interaction.pdf"), plot = p_final_axis, width = 16, height = 10, units = "in")
+```
+
+# HPV detection counts summary
+
+```{r}
+# Create upset_data from final_merged_data
+upset_data <- final_merged_data %>%
+  select(Any_Positive, Triple_Positive, P16_Positive, HPV16DNA_Positive, HPV16RNA_Positive, P53)
+
+# HPV detection counts summary
+hpv_detection_summary <- data.frame(
+  Detection_Method = c("Any Positive", "Triple Positive", "P16+", "DNA+", "RNA+"),
+  Count = c(
+    sum(upset_data$Any_Positive == "Positive", na.rm = TRUE),
+    sum(upset_data$Triple_Positive == "Positive", na.rm = TRUE),
+    sum(upset_data$P16_Positive == "Positive", na.rm = TRUE),
+    sum(upset_data$HPV16DNA_Positive == "Positive", na.rm = TRUE),
+    sum(upset_data$HPV16RNA_Positive == "Positive", na.rm = TRUE)
+  )
+)
+
+# P53 positive/negative by HPV detection method
+p53_hpv_breakdown <- data.frame(
+  Detection_Method = rep(c("Any Positive", "Triple Positive", "P16+", "DNA+", "RNA+"), 2),
+  P53_Status = rep(c("P53 Positive", "P53 Negative"), each = 5),
+  Count = c(
+    # P53 Positive
+    sum(upset_data$Any_Positive == "Positive" & upset_data$P53 == "Positive", na.rm = TRUE),
+    sum(upset_data$Triple_Positive == "Positive" & upset_data$P53 == "Positive", na.rm = TRUE),
+    sum(upset_data$P16_Positive == "Positive" & upset_data$P53 == "Positive", na.rm = TRUE),
+    sum(upset_data$HPV16DNA_Positive == "Positive" & upset_data$P53 == "Positive", na.rm = TRUE),
+    sum(upset_data$HPV16RNA_Positive == "Positive" & upset_data$P53 == "Positive", na.rm = TRUE),
+    # P53 Negative
+    sum(upset_data$Any_Positive == "Positive" & upset_data$P53 == "Negative", na.rm = TRUE),
+    sum(upset_data$Triple_Positive == "Positive" & upset_data$P53 == "Negative", na.rm = TRUE),
+    sum(upset_data$P16_Positive == "Positive" & upset_data$P53 == "Negative", na.rm = TRUE),
+    sum(upset_data$HPV16DNA_Positive == "Positive" & upset_data$P53 == "Negative", na.rm = TRUE),
+    sum(upset_data$HPV16RNA_Positive == "Positive" & upset_data$P53 == "Negative", na.rm = TRUE)
+  )
+)
+
+cat("\n=== HPV DETECTION METHOD COUNTS ===\n")
+print(hpv_detection_summary)
+
+cat("\n=== HPV DETECTION BY P53 STATUS ===\n")
+print(p53_hpv_breakdown)
+
+# Save to CSV
+write.csv(hpv_detection_summary, file.path(DKTK_OUT, "summary_hpv_detection_counts.csv"), row.names = FALSE)
+write.csv(p53_hpv_breakdown, file.path(DKTK_OUT, "summary_hpv_p53_breakdown.csv"), row.names = FALSE)
+```
+
+
+

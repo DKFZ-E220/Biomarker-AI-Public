@@ -1,0 +1,1636 @@
+---
+title: "Preclinical DESeq2 — HPV+ vs HPV- per cell line"
+output: html_document
+---
+
+```{r config, include=FALSE}
+# Load paths and constants (DATA_DIR, RESULTS_DIR, PRECLIN_TX_DATA, PRECLIN_TX_OUT, ...).
+# Place raw input files under data/preclinical_transcriptomics/ (see data/README.md).
+source(here::here("config.R"))
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# 1. Aim
+
+## Generating Count files for all 36 HPV samples from 6 Cell Lines, FaDu, Cal33, SAS (HPV-) and UDSCC2, UPCISCC154, UMSCC47 (HPV+)
+
+
+# 2. Loading packages 
+
+```{r echo=TRUE, warning=FALSE, results='hide', message=FALSE}
+#if (!require("BiocManager", quietly = TRUE))
+    #install.packages("BiocManager")
+
+#BiocManager::install("apeglm")
+library(apeglm)
+library(DESeq2)
+library(ashr) #in order to shrink logFC if we use contrasts instead of coefficients to retrieve results
+library(tidyverse)
+library(ggplot2)
+library(readxl)
+library(pheatmap)
+library(tibble)
+library(dplyr)
+```
+
+
+# 3. Making input files ready for deseq2, start with whole comparison
+
+```{r}
+Matrix = read.csv(file.path(PRECLIN_TX_DATA, "countall.csv")) 
+attach(Matrix)
+#if we target the mean of counts
+#Matrix = aggregate(Matrix,FUN = mean,by=list(Matrix$Genes))
+
+#if we a trget max of counts
+Matrix = aggregate(Matrix,FUN = max,by=list(Matrix$Genes))
+Matrix <- Matrix[-1,-1]
+
+#write.csv(Matrix, "Maxcountall.csv")
+```
+
+
+```{r}
+#setting the row names (genes) for each samples
+
+HNSCC_matrix = Matrix[,-1]
+rownames(HNSCC_matrix) = Matrix[,1]
+
+#input of the metadata
+Metadata = read.csv(file.path(PRECLIN_TX_DATA, "Metadata_HNSCC.csv"))
+rownames(Metadata) <- Metadata[,1]
+Metadata = subset(Metadata, select = -1 )
+#if the row names of metadata is in same seq as column of matrix
+all(rownames(Metadata) == colnames(HNSCC_matrix))
+
+
+
+```
+
+# Create DESeq object
+```{r}
+dds_wt <- DESeqDataSetFromMatrix(countData = round(HNSCC_matrix),
+                                 colData = Metadata,
+                                 design = ~ Group)
+```
+
+
+#keeping genes with count values >= 10
+```{r}
+keep <- rowSums(counts(dds_wt)) >= 10
+dds_wt <- dds_wt[keep,]
+
+# Get the gene identifiers of the remaining genes
+#remaining_genes <- rownames(dds_wt)
+#remaining_genes <- data.frame(remaining_genes)
+#remaining_genes
+
+# Optionally, you could also determine the total number of remaining genes
+#num_remaining_genes <- length(remaining_genes)
+#num_remaining_genes
+```
+
+
+#Count normalization---> calculation
+```{r}
+dds_wt <- estimateSizeFactors(dds_wt)
+sizeFactors(dds_wt)
+```
+
+
+
+#Count normalization---> extraction
+```{r}
+normalized_wt_counts <- counts(dds_wt, normalized=TRUE)
+#write.csv(normalized_wt_counts,'HPV_all_normalized.csv')
+
+```
+
+
+
+
+# Run analysis
+```{r, message=FALSE}
+dds_wt <- DESeq(dds_wt)
+
+
+
+wt_res <- results(dds_wt,
+                  contrast = c("Group", "Untreated",
+                               "Treated_4GY"),
+                  alpha = 0.05,
+                  lfcThreshold = .585)
+wt_res
+```
+
+
+
+
+```{r}
+result = data.frame(wt_res)
+
+write.csv(result, file = file.path(PRECLIN_TX_OUT, "deg_untreatedvstreated_lfcchange1.5.csv"))
+padj <- result$padj
+any(padj <0.05)
+```
+So, no signficant genes between the treated vs untreated
+
+
+#lets check if the treatment varies with HPV status
+
+
+
+# 3. Making input files ready for deseq2, start with whole comparison
+
+```{r}
+Matrix = read.csv(file.path(PRECLIN_TX_DATA, "countall.csv")) 
+attach(Matrix)
+#if we target the mean of counts
+#Matrix = aggregate(Matrix,FUN = mean,by=list(Matrix$Genes))
+
+#if we a trget max of counts
+Matrix = aggregate(Matrix,FUN = max,by=list(Matrix$Genes))
+Matrix <- Matrix[-1,-1]
+
+#write.csv(Matrix, "Maxcountall.csv")
+```
+
+
+```{r}
+#setting the row names (genes) for each samples
+
+HNSCC_matrix = Matrix[,-1]
+rownames(HNSCC_matrix) = Matrix[,1]
+
+#input of the metadata
+Metadata = read.csv(file.path(PRECLIN_TX_DATA, "Metadata_HNSCC.csv"))
+rownames(Metadata) <- Metadata[,1]
+Metadata = subset(Metadata, select = -1 )
+#if the row names of metadata is in same seq as column of matrix
+all(rownames(Metadata) == colnames(HNSCC_matrix))
+
+
+
+```
+# Create DESeq object
+```{r}
+dds_wt <- DESeqDataSetFromMatrix(countData = round(HNSCC_matrix),
+                                 colData = Metadata,
+                                design = ~ HPV)
+```
+
+# Create DESeq object (treatment with respect to HPV)
+```{r}
+dds_wt <- DESeqDataSetFromMatrix(countData = round(HNSCC_matrix),
+                                 colData = Metadata,
+                                design = ~ HPV + Group + HPV:Group)
+```
+
+
+#keeping genes with count values >= 10
+```{r}
+keep <- rowSums(counts(dds_wt)) >= 10
+dds_wt <- dds_wt[keep,]
+```
+
+
+```{r}
+# Get the gene identifiers of the remaining genes
+remaining_genes <- rownames(dds_wt)
+remaining_genes <- data.frame(remaining_genes)
+remaining_genes
+
+# Optionally, you could also determine the total number of remaining genes
+#num_remaining_genes <- length(remaining_genes)
+#num_remaining_genes
+```
+
+
+#Count normalization---> calculation
+```{r}
+dds_wt <- estimateSizeFactors(dds_wt)
+sizeFactors(dds_wt)
+```
+
+
+
+#Count normalization---> extraction
+```{r}
+normalized_wt_counts <- counts(dds_wt, normalized=TRUE)
+#write.csv(normalized_wt_counts,'HPV_all_normalized.csv')
+
+```
+
+
+
+
+# Run analysis
+```{r, message=FALSE}
+dds_wt <- DESeq(dds_wt)
+
+
+wt_res <- results(dds_wt, contrast = c("HPV", "HPV_Positive",
+                               "HPV_Negative"),alpha = 0.05, lfcThreshold = .585)
+wt_res
+```
+
+
+
+
+
+```{r}
+result = data.frame(wt_res)
+
+#write.csv(result, file = 'deg_allsamples_HPV-vsHPV+_lfcchange1.5.csv')
+
+result %>%
+  arrange(padj)
+filtered_padj <- filter(result,padj<0.05)
+#write.csv(filtered_padj,"significant degs allsamplesHPV-vsHPV+_lfc1.5change.csv")
+dim(filtered_padj)
+```
+
+include a volcano plot
+
+```{r}
+# Create a volcano plot with different colors for upregulated and downregulated genes
+volcano_plot <- ggplot(result, aes(x = log2FoldChange, y = -log10(padj))) +
+  geom_point(aes(color = ifelse(padj < 0.05, ifelse(log2FoldChange > 0, "Upregulated", "Downregulated"), "Not Significant")), size = 2) +
+  scale_color_manual(values = c("Upregulated" = "#1f78b4", "Downregulated" = "#FFB000", "Not Significant" = "gray")) +
+  theme_classic() +
+  theme(legend.position = "none") +
+  labs(x = "Log2 Fold Change", y = "-log10(padj)") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") +
+  geom_vline(xintercept = c(-0.585, 0.585), linetype = "dashed", color = "black") +
+  ggtitle("HPV- vs HPV+ (untreated) ")
+
+# Print the plot
+print(volcano_plot)
+
+ggsave(file.path(PRECLIN_TX_OUT, "volcano_untreated_HPVneg_vs_HPVpos.png"),volcano_plot,width = 6, height = 4 )
+ 
+
+```
+
+
+```{r}
+vsd <- vst(dds_wt, blind=FALSE)
+plotPCA(vsd, intgroup=c("Cell_Line", "Group"))
+```
+
+
+
+#Analyses Untreated vs Treated cell line specific
+
+# For individual cell line analyses
+#Fadu Untreated vs treated
+```{r}
+#input of the count matrix as csv file
+Matrix = read.csv(file.path(PRECLIN_TX_DATA, "countall.csv")) 
+Matrix_fadu <- Matrix %>% select(starts_with('FaDu'))
+Matrix_genes <- Matrix %>% select(starts_with('Genes'))
+Matrix <- cbind(Matrix_genes, Matrix_fadu)
+attach(Matrix)
+
+
+#if we target the mean of counts
+#Matrix = aggregate(Matrix,FUN = mean,by=list(Matrix$Genes))
+
+#if we a trget max of counts
+Matrix = aggregate(Matrix,FUN = max,by=list(Matrix$Genes))
+Matrix <- Matrix[-1,-1]
+#setting the row names (genes) for each samples
+
+HNSCC_matrix = Matrix[,-1]
+rownames(HNSCC_matrix) = Matrix[,1]
+
+
+#input of the metadata
+Metadata = read.csv(file.path(PRECLIN_TX_DATA, "Metadata_HNSCC.csv"))
+fadu1 <- Metadata[1:3,]
+fadu2 <- Metadata[19:21,]
+Metadata <- rbind(fadu1,fadu2)
+rownames(Metadata) <- Metadata[,1]
+Metadata = subset(Metadata, select = -1 )
+#if the row names of metadata is in same seq as column of matrix
+all(rownames(Metadata) == colnames(HNSCC_matrix))
+
+
+```
+
+# Create DESeq object
+```{r}
+dds_wt <- DESeqDataSetFromMatrix(countData = round(HNSCC_matrix),
+                                 colData = Metadata,
+                                 design = ~ Group)
+```
+
+
+#keeping genes with count values >= 10
+```{r}
+keep <- rowSums(counts(dds_wt)) >= 10
+dds_wt <- dds_wt[keep,]
+```
+
+
+#Count normalization---> calculation
+```{r}
+dds_wt <- estimateSizeFactors(dds_wt)
+sizeFactors(dds_wt)
+```
+
+
+
+#Count normalization---> extraction
+```{r}
+normalized_wt_counts <- counts(dds_wt, normalized=TRUE)
+write.csv(normalized_wt_counts,'HPV_Fadu_normalized.csv')
+
+```
+
+
+
+
+# Run analysis
+```{r, message=FALSE}
+dds_wt <- DESeq(dds_wt)
+
+results(dds_wt, alpha = 0.05) #sample result
+
+wt_res <- results(dds_wt,
+                  contrast = c("Group", "Untreated",
+                               "Treated_4GY"),
+                  alpha = 0.05,
+                  lfcThreshold = 0.585)
+wt_res
+```
+
+
+
+
+```{r include=FALSE}
+result = data.frame(wt_res)
+
+write.csv(result, file = 'deg_Fadu_lfchcange1.5.csv')
+padj <- result$padj
+any(padj <0.05)
+result %>%
+  arrange(padj)
+filter(result,padj<0.05)
+```
+#SAS Untreated vs treated
+```{r}
+#input of the count matrix as csv file
+Matrix = read.csv(file.path(PRECLIN_TX_DATA, "countall.csv")) 
+Matrix_fadu <- Matrix %>% select(starts_with('SAS'))
+Matrix_genes <- Matrix %>% select(starts_with('Genes'))
+Matrix <- cbind(Matrix_genes, Matrix_fadu)
+attach(Matrix)
+
+
+#if we target the mean of counts
+#Matrix = aggregate(Matrix,FUN = mean,by=list(Matrix$Genes))
+
+#if we a trget max of counts
+Matrix = aggregate(Matrix,FUN = max,by=list(Matrix$Genes))
+Matrix <- Matrix[-1,-1]
+#setting the row names (genes) for each samples
+
+HNSCC_matrix = Matrix[,-1]
+rownames(HNSCC_matrix) = Matrix[,1]
+
+
+#input of the metadata
+Metadata = read.csv(file.path(PRECLIN_TX_DATA, "Metadata_HNSCC.csv"))
+fadu1 <- Metadata[4:6,]
+fadu2 <- Metadata[22:24,]
+Metadata <- rbind(fadu1,fadu2)
+rownames(Metadata) <- Metadata[,1]
+Metadata = subset(Metadata, select = -1 )
+#if the row names of metadata is in same seq as column of matrix
+all(rownames(Metadata) == colnames(HNSCC_matrix))
+
+
+```
+
+# Create DESeq object
+```{r}
+dds_wt <- DESeqDataSetFromMatrix(countData = round(HNSCC_matrix),
+                                 colData = Metadata,
+                                 design = ~ Group)
+```
+
+
+#keeping genes with count values >= 10
+```{r}
+keep <- rowSums(counts(dds_wt)) >= 10
+dds_wt <- dds_wt[keep,]
+```
+
+
+#Count normalization---> calculation
+```{r}
+dds_wt <- estimateSizeFactors(dds_wt)
+sizeFactors(dds_wt)
+```
+
+
+
+#Count normalization---> extraction
+```{r}
+normalized_wt_counts <- counts(dds_wt, normalized=TRUE)
+write.csv(normalized_wt_counts,'HPV_SAS_normalized.csv')
+
+```
+
+
+
+
+# Run analysis
+```{r, message=FALSE}
+dds_wt <- DESeq(dds_wt)
+
+results(dds_wt, alpha = 0.05) #sample result
+
+wt_res <- results(dds_wt,
+                  contrast = c("Group", "Untreated",
+                               "Treated_4GY"),
+                  alpha = 0.05,
+                  lfcThreshold = 0.585)
+wt_res
+```
+
+
+
+
+```{r include=FALSE}
+result = data.frame(wt_res)
+
+write.csv(result, file = 'deg_SAS_lfchcange1.5.csv')
+padj <- result$padj
+any(padj <0.05)
+result %>%
+  arrange(padj)
+filter(result,padj<0.05)
+```
+#Cal33 Untreated vs treated
+```{r}
+#input of the count matrix as csv file
+Matrix = read.csv(file.path(PRECLIN_TX_DATA, "countall.csv")) 
+Matrix_fadu <- Matrix %>% select(starts_with('Cal'))
+Matrix_genes <- Matrix %>% select(starts_with('Genes'))
+Matrix <- cbind(Matrix_genes, Matrix_fadu)
+attach(Matrix)
+
+
+#if we target the mean of counts
+#Matrix = aggregate(Matrix,FUN = mean,by=list(Matrix$Genes))
+
+#if we a trget max of counts
+Matrix = aggregate(Matrix,FUN = max,by=list(Matrix$Genes))
+Matrix <- Matrix[-1,-1]
+#setting the row names (genes) for each samples
+
+HNSCC_matrix = Matrix[,-1]
+rownames(HNSCC_matrix) = Matrix[,1]
+
+
+#input of the metadata
+Metadata = read.csv(file.path(PRECLIN_TX_DATA, "Metadata_HNSCC.csv"))
+fadu1 <- Metadata[7:9,]
+fadu2 <- Metadata[25:27,]
+Metadata <- rbind(fadu1,fadu2)
+rownames(Metadata) <- Metadata[,1]
+Metadata = subset(Metadata, select = -1 )
+#if the row names of metadata is in same seq as column of matrix
+all(rownames(Metadata) == colnames(HNSCC_matrix))
+
+
+```
+
+# Create DESeq object
+```{r}
+dds_wt <- DESeqDataSetFromMatrix(countData = round(HNSCC_matrix),
+                                 colData = Metadata,
+                                 design = ~ Group)
+```
+
+
+#keeping genes with count values >= 10
+```{r}
+keep <- rowSums(counts(dds_wt)) >= 10
+dds_wt <- dds_wt[keep,]
+```
+
+
+#Count normalization---> calculation
+```{r}
+dds_wt <- estimateSizeFactors(dds_wt)
+sizeFactors(dds_wt)
+```
+
+
+
+#Count normalization---> extraction
+```{r}
+normalized_wt_counts <- counts(dds_wt, normalized=TRUE)
+write.csv(normalized_wt_counts,'HPV_Cal_normalized.csv')
+
+```
+
+
+
+
+# Run analysis
+```{r, message=FALSE}
+dds_wt <- DESeq(dds_wt)
+
+results(dds_wt, alpha = 0.05) #sample result
+
+wt_res <- results(dds_wt,
+                  contrast = c("Group", "Untreated",
+                               "Treated_4GY"),
+                  alpha = 0.05,
+                  lfcThreshold = 0.585)
+wt_res
+```
+
+
+
+
+```{r include=FALSE}
+result = data.frame(wt_res)
+
+write.csv(result, file = 'deg_Cal33_lfchcange1.5.csv')
+padj <- result$padj
+any(padj <0.05)
+result %>%
+  arrange(padj)
+filter(result,padj<0.05)
+```
+#UDSCC2 Untreated vs treated
+```{r}
+#input of the count matrix as csv file
+Matrix = read.csv(file.path(PRECLIN_TX_DATA, "countall.csv")) 
+Matrix_fadu <- Matrix %>% select(starts_with('UD'))
+Matrix_genes <- Matrix %>% select(starts_with('Genes'))
+Matrix <- cbind(Matrix_genes, Matrix_fadu)
+attach(Matrix)
+
+
+#if we target the mean of counts
+#Matrix = aggregate(Matrix,FUN = mean,by=list(Matrix$Genes))
+
+#if we a trget max of counts
+Matrix = aggregate(Matrix,FUN = max,by=list(Matrix$Genes))
+Matrix <- Matrix[-1,-1]
+#setting the row names (genes) for each samples
+
+HNSCC_matrix = Matrix[,-1]
+rownames(HNSCC_matrix) = Matrix[,1]
+
+
+#input of the metadata
+Metadata = read.csv(file.path(PRECLIN_TX_DATA, "Metadata_HNSCC.csv"))
+fadu1 <- Metadata[10:12,]
+fadu2 <- Metadata[28:30,]
+Metadata <- rbind(fadu1,fadu2)
+rownames(Metadata) <- Metadata[,1]
+Metadata = subset(Metadata, select = -1 )
+#if the row names of metadata is in same seq as column of matrix
+all(rownames(Metadata) == colnames(HNSCC_matrix))
+
+
+```
+
+# Create DESeq object
+```{r}
+dds_wt <- DESeqDataSetFromMatrix(countData = round(HNSCC_matrix),
+                                 colData = Metadata,
+                                 design = ~ Group)
+```
+
+
+#keeping genes with count values >= 10
+```{r}
+keep <- rowSums(counts(dds_wt)) >= 10
+dds_wt <- dds_wt[keep,]
+```
+
+
+#Count normalization---> calculation
+```{r}
+dds_wt <- estimateSizeFactors(dds_wt)
+sizeFactors(dds_wt)
+```
+
+
+
+#Count normalization---> extraction
+```{r}
+normalized_wt_counts <- counts(dds_wt, normalized=TRUE)
+write.csv(normalized_wt_counts,'HPV_UDSCC2_normalized.csv')
+
+```
+
+
+
+
+# Run analysis
+```{r, message=FALSE}
+dds_wt <- DESeq(dds_wt)
+
+results(dds_wt, alpha = 0.05) #sample result
+
+wt_res <- results(dds_wt,
+                  contrast = c("Group", "Untreated",
+                               "Treated_4GY"),
+                  alpha = 0.05,
+                  lfcThreshold = 0.585)
+wt_res
+
+
+```
+
+
+
+
+```{r include=FALSE}
+result = data.frame(wt_res)
+
+write.csv(result, file = 'deg_UDSCC2_lfchcange1.5.csv')
+padj <- result$padj
+any(padj <0.05)
+result %>%
+  arrange(padj)
+filter(result,padj<0.05)
+```
+#UMSCC47 Untreated vs treated
+```{r}
+#input of the count matrix as csv file
+Matrix = read.csv(file.path(PRECLIN_TX_DATA, "countall.csv")) 
+Matrix_fadu <- Matrix %>% select(starts_with('UM'))
+Matrix_genes <- Matrix %>% select(starts_with('Genes'))
+Matrix <- cbind(Matrix_genes, Matrix_fadu)
+attach(Matrix)
+
+
+#if we target the mean of counts
+#Matrix = aggregate(Matrix,FUN = mean,by=list(Matrix$Genes))
+
+#if we a trget max of counts
+Matrix = aggregate(Matrix,FUN = max,by=list(Matrix$Genes))
+Matrix <- Matrix[-1,-1]
+#setting the row names (genes) for each samples
+
+HNSCC_matrix = Matrix[,-1]
+rownames(HNSCC_matrix) = Matrix[,1]
+
+
+#input of the metadata
+Metadata = read.csv(file.path(PRECLIN_TX_DATA, "Metadata_HNSCC.csv"))
+fadu1 <- Metadata[13:15,]
+fadu2 <- Metadata[31:33,]
+Metadata <- rbind(fadu1,fadu2)
+rownames(Metadata) <- Metadata[,1]
+Metadata = subset(Metadata, select = -1 )
+#if the row names of metadata is in same seq as column of matrix
+all(rownames(Metadata) == colnames(HNSCC_matrix))
+
+
+```
+
+# Create DESeq object
+```{r}
+dds_wt <- DESeqDataSetFromMatrix(countData = round(HNSCC_matrix),
+                                 colData = Metadata,
+                                 design = ~ Group)
+```
+
+
+#keeping genes with count values >= 10
+```{r}
+keep <- rowSums(counts(dds_wt)) >= 10
+dds_wt <- dds_wt[keep,]
+```
+
+
+#Count normalization---> calculation
+```{r}
+dds_wt <- estimateSizeFactors(dds_wt)
+sizeFactors(dds_wt)
+```
+
+
+
+#Count normalization---> extraction
+```{r}
+normalized_wt_counts <- counts(dds_wt, normalized=TRUE)
+write.csv(normalized_wt_counts,'HPV_UMSCC47_normalized.csv')
+
+```
+
+
+
+
+# Run analysis
+```{r, message=FALSE}
+dds_wt <- DESeq(dds_wt)
+
+results(dds_wt, alpha = 0.05) #sample result
+
+wt_res <- results(dds_wt,
+                  contrast = c("Group", "Untreated",
+                               "Treated_4GY"),
+                  alpha = 0.05,
+                  lfcThreshold = 0.585)
+wt_res
+```
+
+
+
+
+```{r include=FALSE}
+result = data.frame(wt_res)
+
+write.csv(result, file = 'deg_UMSCC47_lfchcange1.5.csv')
+padj <- result$padj
+any(padj <0.05)
+result %>%
+  arrange(padj)
+filter(result,padj<0.05)
+```
+#UPCI154 Untreated vs treated
+```{r}
+#input of the count matrix as csv file
+Matrix = read.csv(file.path(PRECLIN_TX_DATA, "countall.csv")) 
+Matrix_fadu <- Matrix %>% select(starts_with('UP'))
+Matrix_genes <- Matrix %>% select(starts_with('Genes'))
+Matrix <- cbind(Matrix_genes, Matrix_fadu)
+attach(Matrix)
+
+
+#if we target the mean of counts
+#Matrix = aggregate(Matrix,FUN = mean,by=list(Matrix$Genes))
+
+#if we a trget max of counts
+Matrix = aggregate(Matrix,FUN = max,by=list(Matrix$Genes))
+Matrix <- Matrix[-1,-1]
+#setting the row names (genes) for each samples
+
+HNSCC_matrix = Matrix[,-1]
+rownames(HNSCC_matrix) = Matrix[,1]
+
+
+#input of the metadata
+Metadata = read.csv(file.path(PRECLIN_TX_DATA, "Metadata_HNSCC.csv"))
+fadu1 <- Metadata[16:18,]
+fadu2 <- Metadata[34:36,]
+Metadata <- rbind(fadu1,fadu2)
+rownames(Metadata) <- Metadata[,1]
+Metadata = subset(Metadata, select = -1 )
+#if the row names of metadata is in same seq as column of matrix
+all(rownames(Metadata) == colnames(HNSCC_matrix))
+
+
+```
+
+# Create DESeq object
+```{r}
+dds_wt <- DESeqDataSetFromMatrix(countData = round(HNSCC_matrix),
+                                 colData = Metadata,
+                                 design = ~ Group)
+```
+
+
+#keeping genes with count values >= 10
+```{r}
+keep <- rowSums(counts(dds_wt)) >= 10
+dds_wt <- dds_wt[keep,]
+```
+
+
+#Count normalization---> calculation
+```{r}
+dds_wt <- estimateSizeFactors(dds_wt)
+sizeFactors(dds_wt)
+```
+
+
+
+#Count normalization---> extraction
+```{r}
+normalized_wt_counts <- counts(dds_wt, normalized=TRUE)
+write.csv(normalized_wt_counts,'HPV_UPCI154_normalized.csv')
+
+```
+
+
+
+
+# Run analysis
+```{r, message=FALSE}
+dds_wt <- DESeq(dds_wt)
+
+results(dds_wt, alpha = 0.05) #sample result
+
+wt_res <- results(dds_wt,
+                  contrast = c("Group", "Untreated",
+                               "Treated_4GY"),
+                  alpha = 0.05,
+                  lfcThreshold = 0.585)
+wt_res
+```
+
+
+
+
+```{r include=FALSE}
+result = data.frame(wt_res)
+
+write.csv(result, file = 'deg_UPCI154_lfchcange1.5.csv')
+padj <- result$padj
+any(padj <0.05)
+result %>%
+  arrange(padj)
+filter(result,padj<0.05)
+```
+
+
+
+
+
+
+
+
+####all cell lines
+
+
+
+#Untreated HPV- vs +
+```{r}
+#input of the count matrix as csv file
+Matrix = read.csv(file.path(PRECLIN_TX_DATA, "countall.csv")) 
+Matrix<- Matrix[,1:19]
+attach(Matrix)
+
+
+#if we target the mean of counts
+#Matrix = aggregate(Matrix,FUN = mean,by=list(Matrix$Genes))
+
+#if we a trget max of counts
+Matrix = aggregate(Matrix,FUN = max,by=list(Matrix$Genes))
+Matrix <- Matrix[-1,-1]
+#setting the row names (genes) for each samples
+
+HNSCC_matrix = Matrix[,-1]
+rownames(HNSCC_matrix) = Matrix[,1]
+
+
+#input of the metadata
+Metadata = read.csv(file.path(PRECLIN_TX_DATA, "Metadata_HNSCC.csv"))
+Metadata <- Metadata[1:18,]
+rownames(Metadata) <- Metadata[,1]
+Metadata = subset(Metadata, select = -1 )
+#if the row names of metadata is in same seq as column of matrix
+all(rownames(Metadata) == colnames(HNSCC_matrix))
+
+
+```
+
+# Create DESeq object
+```{r}
+dds_wt <- DESeqDataSetFromMatrix(countData = round(HNSCC_matrix),
+                                 colData = Metadata,
+                                 design = ~ HPV)
+
+#keeping genes with count values >= 10
+keep <- rowSums(counts(dds_wt)) >= 10
+dds_wt <- dds_wt[keep,]
+```
+
+
+#Count normalization---> calculation
+```{r}
+dds_wt <- estimateSizeFactors(dds_wt)
+sizeFactors(dds_wt)
+
+#Count normalization---> extraction
+normalized_wt_counts <- counts(dds_wt, normalized=TRUE)
+#write.csv(normalized_wt_counts,'Untreated_normalized.csv')
+plot(normalized_wt_counts)
+boxplot(log10(assays(dds_wt)[["cooks"]]), range=0, las=2,main="Cook's distance", cex.axis=0.3)
+```
+
+
+
+
+# Run analysis
+```{r, message=FALSE}
+dds_wt <- DESeq(dds_wt)
+
+
+wt_res <- results(dds_wt,
+                  contrast = c("HPV", "HPV_Positive",
+                               "HPV_Negative"),
+                  alpha = 0.05,
+                  lfcThreshold = 0.585)
+wt_res
+result = data.frame(wt_res)
+# Create a new column 'gene_symbol' with row names (gene names)
+  result$gene_symbol <- rownames(result)
+ # Optionally, if you want 'gene_symbol' to be the first column
+  result <- result[, c("gene_symbol", setdiff(names(result), "gene_symbol"))]
+```
+
+
+include a volcano plot
+
+```{r}
+# Create a volcano plot with different colors for upregulated and downregulated genes
+volcano_plot <- ggplot(result, aes(x = log2FoldChange, y = -log10(padj))) +
+  geom_point(aes(color = ifelse(padj < 0.05, ifelse(log2FoldChange > 0, "Upregulated", "Downregulated"), "Not Significant")), size = 2) +
+  scale_color_manual(values = c("Upregulated" = "#1f78b4", "Downregulated" = "#FFB000", "Not Significant" = "gray")) +
+  theme_classic() +
+  theme(legend.position = "none") +
+  labs(x = "Log2 Fold Change", y = "-log10(padj)") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") +
+  geom_vline(xintercept = c(-0.585, 0.585), linetype = "dashed", color = "black") +
+  ggtitle("HPV- vs HPV+ (untreated) ")
+
+# Print the plot
+print(volcano_plot)
+
+ggsave(file.path(PRECLIN_TX_OUT, "volcano_untreated_HPVneg_vs_HPVpos.png"),volcano_plot,width = 6, height = 4 )
+ 
+
+```
+
+
+```{r include=FALSE}
+
+
+write.csv(result, file = 'deg_Untreated_fchcange1.5.csv', row.names = F)
+padj <- result$padj
+any(padj <0.05)
+result %>%
+  arrange(padj)
+filtered_padj <- filter(result,padj<0.05)
+write.csv(filtered_padj, file.path(PRECLIN_TX_OUT, "significant_degs_untreated_fc1.5change.csv"))
+dim(filtered_padj)
+```
+
+```{r}
+vsd <- vst(dds_wt, blind=FALSE)
+plotPCA(vsd, intgroup=c("Cell_Line", "Group"))
+```
+
+
+
+
+
+
+
+
+
+
+#Treated HPV- vs +
+
+
+
+
+
+
+```{r}
+#input of the count matrix as csv file
+Matrix = read.csv(file.path(PRECLIN_TX_DATA, "countall.csv")) 
+Matrix_fadu <- Matrix[,20:37]
+Matrix_genes <- Matrix %>% dplyr::select(starts_with('Genes'))
+Matrix <- cbind(Matrix_genes, Matrix_fadu)
+attach(Matrix)
+
+
+#if we target the mean of counts
+#Matrix = aggregate(Matrix,FUN = mean,by=list(Matrix$Genes))
+
+#if we a trget max of counts
+Matrix = aggregate(Matrix,FUN = max,by=list(Matrix$Genes))
+Matrix <- Matrix[-1,-1]
+#setting the row names (genes) for each samples
+
+HNSCC_matrix = Matrix[,-1]
+rownames(HNSCC_matrix) = Matrix[,1]
+
+
+#input of the metadata
+Metadata = read.csv(file.path(PRECLIN_TX_DATA, "Metadata_HNSCC.csv"))
+Metadata <- Metadata[19:36,]
+rownames(Metadata) <- Metadata[,1]
+Metadata = subset(Metadata, select = -1 )
+#if the row names of metadata is in same seq as column of matrix
+all(rownames(Metadata) == colnames(HNSCC_matrix))
+
+
+```
+
+# Create DESeq object
+```{r}
+dds_wt <- DESeqDataSetFromMatrix(countData = round(HNSCC_matrix),
+                                 colData = Metadata,
+                                 design = ~ HPV)
+#keeping genes with count values >= 10
+keep <- rowSums(counts(dds_wt)) >= 10
+dds_wt <- dds_wt[keep,]
+```
+
+
+#Count normalization---> calculation
+```{r}
+dds_wt <- estimateSizeFactors(dds_wt)
+sizeFactors(dds_wt)
+
+#Count normalization---> extraction
+normalized_wt_counts <- counts(dds_wt, normalized=TRUE)
+#write.csv(normalized_wt_counts,'Treated_normalized.csv')
+plot(normalized_wt_counts)
+```
+
+
+
+
+# Run analysis
+```{r, message=FALSE}
+dds_wt <- DESeq(dds_wt)
+
+wt_res <- results(dds_wt,
+                  contrast = c("HPV", "HPV_Positive",
+                               "HPV_Negative"),
+                  alpha = 0.05,
+                  lfcThreshold = 0.585)
+wt_res
+result = data.frame(wt_res)
+
+#wt_res_shrunk <- lfcShrink(dds_wt, 
+                           #contrast=c("HPV", "HPV_Negative", "HPV_Positive"),
+                           #res=wt_res, 
+                           #type='normal')
+#result_shrunk = data.frame(wt_res_shrunk)
+
+#plotMA(wt_res, ylim=c(-2,2))
+
+# Create a new column 'gene_symbol' with row names (gene names)
+  result$gene_symbol <- rownames(result)
+  # Optionally, if you want 'gene_symbol' to be the first column
+  result <- result[, c("gene_symbol", setdiff(names(result), "gene_symbol"))]
+  
+
+
+```
+
+```{r}
+# Create a volcano plot with different colors for upregulated and downregulated genes
+volcano_plot <- ggplot(result, aes(x = log2FoldChange, y = -log10(padj))) +
+  geom_point(aes(color = ifelse(padj < 0.05, ifelse(log2FoldChange > 0, "Upregulated", "Downregulated"), "Not Significant")), size = 2) +
+  scale_color_manual(values = c("Upregulated" = "#1f78b4", "Downregulated" = "#FFB000", "Not Significant" = "gray")) +
+  theme_classic() +
+  theme(legend.position = "none") +
+  labs(x = "Log2 Fold Change", y = "-log10(padj)") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") +
+  geom_vline(xintercept = c(-0.585, 0.585), linetype = "dashed", color = "black") +
+  ggtitle("HPV- vs HPV+ (treated) ")
+
+# Print the plot
+print(volcano_plot)
+
+ggsave(file.path(PRECLIN_TX_OUT, "volcano_treated_HPVneg_vs_HPVpos.png"),volcano_plot,width = 6, height = 4 )
+```
+
+
+
+```{r include=FALSE}
+
+
+write.csv(result, file = 'deg_treated_lfchcange1.5.csv', row.names = F)
+padj <- result$padj
+any(padj <0.05)
+result %>%
+  arrange(padj)
+filtered_padj <- filter(result,padj<0.05)
+write.csv(filtered_padj, file.path(PRECLIN_TX_OUT, "significant_degs_treated_lfc1.5change.csv"))
+dim(filtered_padj)
+```
+
+
+
+
+
+
+# 3. All samples, HPV- vs HPV+
+
+```{r}
+Matrix = read.csv(file.path(PRECLIN_TX_DATA, "countall.csv")) 
+attach(Matrix)
+#if we target the mean of counts
+#Matrix = aggregate(Matrix,FUN = mean,by=list(Matrix$Genes))
+
+#if we a trget max of counts
+Matrix = aggregate(Matrix,FUN = max,by=list(Matrix$Genes))
+Matrix <- Matrix[-1,-1]
+#setting the row names (genes) for each samples
+
+HNSCC_matrix = Matrix[,-1]
+rownames(HNSCC_matrix) = Matrix[,1]
+
+#input of the metadata
+Metadata = read.csv(file.path(PRECLIN_TX_DATA, "Metadata_HNSCC.csv"))
+rownames(Metadata) <- Metadata[,1]
+Metadata = subset(Metadata, select = -1 )
+#if the row names of metadata is in same seq as column of matrix
+all(rownames(Metadata) == colnames(HNSCC_matrix))
+
+
+
+```
+
+# Create DESeq object
+```{r}
+dds_wt <- DESeqDataSetFromMatrix(countData = round(HNSCC_matrix),
+                                 colData = Metadata,
+                                 design = ~ HPV)
+```
+
+
+#keeping genes with count values >= 10
+```{r}
+keep <- rowSums(counts(dds_wt)) >= 10
+dds_wt <- dds_wt[keep,]
+```
+
+
+#Count normalization---> calculation
+```{r}
+dds_wt <- estimateSizeFactors(dds_wt)
+sizeFactors(dds_wt)
+```
+
+
+
+#Count normalization---> extraction
+```{r}
+normalized_wt_counts <- counts(dds_wt, normalized=TRUE)
+#write.csv(normalized_wt_counts,'HPV_all_normalized_esignbyHPVstatus.csv')
+
+```
+
+
+
+
+# Run analysis
+```{r, message=FALSE}
+dds_wt <- DESeq(dds_wt)
+
+wt_res <- results(dds_wt,
+                  contrast = c("HPV", "HPV_Positive",
+                               "HPV_Negative"),
+                  alpha = 0.05,
+                  lfcThreshold = .585)
+wt_res
+result = data.frame(wt_res)
+```
+
+
+```{r}
+# Create a volcano plot with different colors for upregulated and downregulated genes
+volcano_plot <- ggplot(result, aes(x = log2FoldChange, y = -log10(padj))) +
+  geom_point(aes(color = ifelse(padj < 0.05, ifelse(log2FoldChange > 0, "Upregulated", "Downregulated"), "Not Significant")), size = 2) +
+  scale_color_manual(values = c("Upregulated" = "#1f78b4", "Downregulated" = "#FFB000", "Not Significant" = "gray")) +
+  theme_classic() +
+  theme(legend.position = "none") +
+  labs(x = "Log2 Fold Change", y = "-log10(padj)") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") +
+  geom_vline(xintercept = c(-0.585, 0.585), linetype = "dashed", color = "black") +
+  ggtitle("HPV- vs HPV+ (All samples) ")
+
+# Print the plot
+print(volcano_plot)
+
+ggsave(file.path(PRECLIN_TX_OUT, "volcano_allsamples_HPVneg_vs_HPVpos.png"),volcano_plot,width = 6, height = 4 )
+```
+
+```{r}
+
+
+#write.csv(result, file = 'deg_allsaples_HPV-vsHPV+_lfcchange1.5.csv')
+padj <- result$padj
+any(padj <0.05)
+result %>%
+  arrange(padj)
+filtered_padj <- filter(result,padj<0.05)
+#write.csv(filtered_padj,"significant degs allsamplesHPV-vsHPV+_lfc1.5change.csv")
+dim(filtered_padj)
+```
+
+
+
+
+```{r}
+vsd <- vst(dds_wt, blind=FALSE)
+plotPCA(vsd, intgroup=c("Cell_Line"))
+```
+##another method for subsetting data
+
+```{r}
+#convert results into df
+res_control <- as.data.frame(wt_res)
+
+#subset
+res.untreated_HPV_neg_vsHPV_pos_sub <- subset(res_control, padj < 0.05)
+res.untreated_HPV_neg_vsHPV_pos_sub_final <- na.omit(res.untreated_HPV_neg_vsHPV_pos_sub)
+res.untreated_HPV_neg_vsHPV_pos_sub_final <- cbind(gene_symbol = rownames(res.untreated_HPV_neg_vsHPV_pos_sub_final ), res.untreated_HPV_neg_vsHPV_pos_sub_final ) #we add a column with the gene symbol because we will need it for GSEA
+head(res.untreated_HPV_neg_vsHPV_pos_sub_final)
+write.csv(res.untreated_HPV_neg_vsHPV_pos_sub_final, file.path(PRECLIN_TX_OUT, "res_untreated_HPVneg_vs_HPVpos_sub_final.csv"))
+
+```
+
+
+
+```{r}
+vsd <- vst(dds_wt, blind=FALSE)
+plotPCA(vsd, intgroup=c("Cell_Line", "Group"))
+```
+
+
+```{r}
+library(hrbrthemes)
+pcaData <- plotPCA(vsd, intgroup=c("Cell_Line", "Group"), returnData=TRUE)
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+ggplot(pcaData, aes(PC1, PC2, color=Cell_Line, shape=Group)) +
+  geom_point(size=3) +
+  xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+  ylab(paste0("PC2: ",percentVar[2],"% variance")) + 
+  coord_fixed()+ theme_ipsum()
+
+```
+
+```{r, message=FALSE}
+
+library (genefilter)
+topVarGenes <- head(order(rowVars(assay(vsd)), decreasing = TRUE), 20)
+
+mat  <- assay(vsd)[ topVarGenes, ]
+mat  <- mat - rowMeans(mat)
+anno <- as.data.frame(colData(vsd)[, c("Cell_Line", "Group")])
+pheatmap(mat, annotation_col = anno, cluster_cols= T, color=colorRampPalette(c("#104e8b","#e8e8e8","#b22222"))(n = 100), fontsize = 6.5)
+```
+
+###heatmap of vst files
+```{r}
+sig <- read.csv(file.path(PRECLIN_TX_OUT, "count_untreated_HPVneg_vs_HPVpos_significantgenes.csv"),header = TRUE, stringsAsFactors = FALSE, sep = ",")
+vsdsig <-varianceStabilizingTransformation(object = as.matrix(sig[,-1]))
+breaksList = seq(-3, 3, by = 1)
+anno <- read.csv(file.path(PRECLIN_TX_DATA, "Metadata_HNSCC_untreated.csv"))
+rownames(anno) <- colnames(vsdsig)
+pheatmap(vsdsig,  show_colnames = F, 
+         show_rownames = T,
+
+         annotation_col = anno,
+      
+         annotation_colors = NA,
+         clustering_distance_cols = 'euclidean',
+         clustering_distance_rows = 'euclidean',
+         breaks = breaksList,
+         color = colorRampPalette(c("navy", "white", "firebrick3"))(length(breaksList)),
+         cluster_cols = T,
+         cluster_rows = T,
+         border_color = NA)
+
+```
+#getting vst files
+
+```{r}
+
+#untreated files
+Matrix <- read.csv(file.path(PRECLIN_TX_DATA, "count_untreated.csv"),header = TRUE, stringsAsFactors = FALSE, sep = ",")
+#if we a trget max of counts
+Matrix = aggregate(Matrix,FUN = max,by=list(Matrix$Genes))
+Matrix <- Matrix[-1,-1]
+rownames(Matrix) <- Matrix[ , 1]
+vsd_untreated <-varianceStabilizingTransformation(object = as.matrix(Matrix[,-1]))
+vsd_untreated <- write.csv(vsd_untreated, file.path(PRECLIN_TX_OUT, "Vsd_untreated.csv"))
+#treated files
+
+Matrix <- read.csv(file.path(PRECLIN_TX_DATA, "count_untreated.csv"),header = TRUE, stringsAsFactors = FALSE, sep = ",")
+#if we a trget max of counts
+Matrix = aggregate(Matrix,FUN = max,by=list(Matrix$Genes))
+Matrix <- Matrix[-1,-1]
+rownames(Matrix) <- Matrix[ , 1]
+vsd_untreated <-varianceStabilizingTransformation(object = as.matrix(Matrix[,-1]))
+vsd_untreated <- write.csv(vsd_untreated, file.path(PRECLIN_TX_OUT, "Vsd_untreated.csv"))
+
+
+```
+
+
+
+```{r}
+Matrix <- read.csv(file.path(PRECLIN_TX_DATA, "countall.csv"),header = TRUE, stringsAsFactors = FALSE, sep = ",")
+#if we a trget max of counts
+Matrix = aggregate(Matrix,FUN = max,by=list(Matrix$Genes))
+Matrix <- Matrix[-1,-1]
+rownames(Matrix) <- Matrix[ , 1]
+vsd_all <-varianceStabilizingTransformation(object = as.matrix(Matrix[,-1]))
+#vsd_all<- write.csv(vsd_all,"Vsd_all.csv")
+transposed_vsd <- t(vsd_all)
+vsd_metadata <- read.csv(file.path(PRECLIN_TX_DATA, "Metadata_HNSCC.csv"))
+vsd_metadata <- vsd_metadata[,2:5]
+vsd_dataplusmetadata<- cbind(transposed_vsd, vsd_metadata)
+plotpca <- prcomp(transposed_vsd)
+
+library(ggfortify)
+autoplot(plotpca, data = vsd_dataplusmetadata, colour = 'Cell_Line')
+```
+
+
+```{r}
+library(factoextra)
+plotpca2 <- prcomp(vsd_dataplusmetadata[, 1:55765])
+fviz_pca_ind(plotpca2,
+             col.ind = (vsd_metadata[,1]) # Color by the quality of representation
+      
+             )
+
+```
+
+
+
+
+
+
+```{r}
+
+library(tidyverse)
+library(hrbrthemes)
+library(viridis)
+#Maria_risk-score
+file <- read.csv(file.path(PRECLIN_TX_DATA, "Maria_Risk_Score.csv"))
+attach(file)
+file %>%
+  ggplot( aes(x=file$Cell_Lines, y=file$Risk.Score, fill=file$Cell_Lines)) +
+    geom_boxplot() +
+    scale_fill_viridis(discrete = TRUE, alpha=0.6) +
+    geom_jitter(color="black", size=0.4, alpha=0.9) +
+    theme_ipsum() 
+
+```
+
+
+
+
+#Only HPV-
+
+
+
+
+```{r}
+#input of the count matrix as csv file
+Matrix = read.csv(file.path(PRECLIN_TX_DATA, "countall.csv")) 
+Matrix_fadu <- Matrix[,c(2:10,20:28)]
+Matrix_genes <- Matrix %>% dplyr::select(starts_with('Genes'))
+Matrix <- cbind(Matrix_genes, Matrix_fadu)
+attach(Matrix)
+
+
+#if we target the mean of counts
+#Matrix = aggregate(Matrix,FUN = mean,by=list(Matrix$Genes))
+
+#if we a trget max of counts
+Matrix = aggregate(Matrix,FUN = max,by=list(Matrix$Genes))
+Matrix <- Matrix[-1,-1]
+#setting the row names (genes) for each samples
+
+HNSCC_matrix = Matrix[,-1]
+rownames(HNSCC_matrix) = Matrix[,1]
+
+
+#input of the metadata
+Metadata = read.csv(file.path(PRECLIN_TX_DATA, "Metadata_HNSCC.csv"))
+Metadata <- Metadata[c(1:9,19:27),]
+rownames(Metadata) <- Metadata[,1]
+Metadata = subset(Metadata, select = -1 )
+#if the row names of metadata is in same seq as column of matrix
+all(rownames(Metadata) == colnames(HNSCC_matrix))
+
+
+```
+
+# Create DESeq object
+```{r}
+dds_wt <- DESeqDataSetFromMatrix(countData = round(HNSCC_matrix),
+                                 colData = Metadata,
+                                 design = ~ Group)
+#keeping genes with count values >= 10
+keep <- rowSums(counts(dds_wt)) >= 10
+dds_wt <- dds_wt[keep,]
+```
+
+
+#Count normalization---> calculation
+```{r}
+dds_wt <- estimateSizeFactors(dds_wt)
+sizeFactors(dds_wt)
+
+#Count normalization---> extraction
+normalized_wt_counts <- counts(dds_wt, normalized=TRUE)
+#write.csv(normalized_wt_counts,'Treated_normalized.csv')
+
+```
+
+
+
+
+# Run analysis
+```{r, message=FALSE}
+dds_wt <- DESeq(dds_wt)
+
+wt_res <- results(dds_wt,
+                  contrast = c("Group", "Treated_4GY",
+                               "Untreated"),
+                  alpha = 0.05,
+                  lfcThreshold = 0.585)
+wt_res
+result = data.frame(wt_res)
+
+#wt_res_shrunk <- lfcShrink(dds_wt, 
+                           #contrast=c("HPV", "HPV_Negative", "HPV_Positive"),
+                           #res=wt_res, 
+                           #type='normal')
+#result_shrunk = data.frame(wt_res_shrunk)
+
+#plotMA(wt_res, ylim=c(-2,2))
+
+# Create a new column 'gene_symbol' with row names (gene names)
+  result$gene_symbol <- rownames(result)
+  # Optionally, if you want 'gene_symbol' to be the first column
+  result <- result[, c("gene_symbol", setdiff(names(result), "gene_symbol"))]
+  
+
+
+```
+
+```{r}
+# Create a volcano plot with different colors for upregulated and downregulated genes
+volcano_plot <- ggplot(result, aes(x = log2FoldChange, y = -log10(padj))) +
+  geom_point(aes(color = ifelse(padj < 0.05, ifelse(log2FoldChange > 0, "Upregulated", "Downregulated"), "Not Significant")), size = 2) +
+  scale_color_manual(values = c("Upregulated" = "#1f78b4", "Downregulated" = "#FFB000", "Not Significant" = "gray")) +
+  theme_classic() +
+  theme(legend.position = "none") +
+  labs(x = "Log2 Fold Change", y = "-log10(padj)") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") +
+  geom_vline(xintercept = c(-0.585, 0.585), linetype = "dashed", color = "black") +
+  ggtitle("HPV- vs HPV+ (treated) ")
+
+# Print the plot
+print(volcano_plot)
+
+ggsave(file.path(PRECLIN_TX_OUT, "volcano_treated_HPVneg_vs_HPVpos.png"),volcano_plot,width = 6, height = 4 )
+```
+
+
+
+```{r include=FALSE}
+
+
+#write.csv(result, file = 'deg_treated_lfchcange1.5.csv', row.names = F)
+padj <- result$padj
+any(padj <0.05)
+result %>%
+  arrange(padj)
+filtered_padj <- filter(result,padj<0.05)
+#write.csv(filtered_padj, file.path(PRECLIN_TX_OUT, "significant_degs_treated_lfc1.5change.csv"))
+dim(filtered_padj)
+```
+
+
+#Only HPV+
+
+
+
+
+```{r}
+#input of the count matrix as csv file
+Matrix = read.csv(file.path(PRECLIN_TX_DATA, "countall.csv")) 
+Matrix_fadu <- Matrix[,c(11:19,29:37)]
+Matrix_genes <- Matrix %>% dplyr::select(starts_with('Genes'))
+Matrix <- cbind(Matrix_genes, Matrix_fadu)
+attach(Matrix)
+
+
+#if we target the mean of counts
+#Matrix = aggregate(Matrix,FUN = mean,by=list(Matrix$Genes))
+
+#if we a trget max of counts
+Matrix = aggregate(Matrix,FUN = max,by=list(Matrix$Genes))
+Matrix <- Matrix[-1,-1]
+#setting the row names (genes) for each samples
+
+HNSCC_matrix = Matrix[,-1]
+rownames(HNSCC_matrix) = Matrix[,1]
+
+
+#input of the metadata
+Metadata = read.csv(file.path(PRECLIN_TX_DATA, "Metadata_HNSCC.csv"))
+Metadata <- Metadata[c(10:18,28:36),]
+rownames(Metadata) <- Metadata[,1]
+Metadata = subset(Metadata, select = -1 )
+#if the row names of metadata is in same seq as column of matrix
+all(rownames(Metadata) == colnames(HNSCC_matrix))
+
+
+```
+
+# Create DESeq object
+```{r}
+dds_wt <- DESeqDataSetFromMatrix(countData = round(HNSCC_matrix),
+                                 colData = Metadata,
+                                 design = ~ Group)
+#keeping genes with count values >= 10
+keep <- rowSums(counts(dds_wt)) >= 10
+dds_wt <- dds_wt[keep,]
+```
+
+
+#Count normalization---> calculation
+```{r}
+dds_wt <- estimateSizeFactors(dds_wt)
+sizeFactors(dds_wt)
+
+#Count normalization---> extraction
+normalized_wt_counts <- counts(dds_wt, normalized=TRUE)
+#write.csv(normalized_wt_counts,'Treated_normalized.csv')
+
+```
+
+
+
+
+# Run analysis
+```{r, message=FALSE}
+dds_wt <- DESeq(dds_wt)
+
+wt_res <- results(dds_wt,
+                  contrast = c("Group", "Treated_4GY",
+                               "Untreated"),
+                  alpha = 0.05,
+                  lfcThreshold = 0.585)
+wt_res
+result = data.frame(wt_res)
+
+#wt_res_shrunk <- lfcShrink(dds_wt, 
+                           #contrast=c("HPV", "HPV_Negative", "HPV_Positive"),
+                           #res=wt_res, 
+                           #type='normal')
+#result_shrunk = data.frame(wt_res_shrunk)
+
+#plotMA(wt_res, ylim=c(-2,2))
+
+# Create a new column 'gene_symbol' with row names (gene names)
+  result$gene_symbol <- rownames(result)
+  # Optionally, if you want 'gene_symbol' to be the first column
+  result <- result[, c("gene_symbol", setdiff(names(result), "gene_symbol"))]
+  
+
+
+```
+
+```{r}
+# Create a volcano plot with different colors for upregulated and downregulated genes
+volcano_plot <- ggplot(result, aes(x = log2FoldChange, y = -log10(padj))) +
+  geom_point(aes(color = ifelse(padj < 0.05, ifelse(log2FoldChange > 0, "Upregulated", "Downregulated"), "Not Significant")), size = 2) +
+  scale_color_manual(values = c("Upregulated" = "#1f78b4", "Downregulated" = "#FFB000", "Not Significant" = "gray")) +
+  theme_classic() +
+  theme(legend.position = "none") +
+  labs(x = "Log2 Fold Change", y = "-log10(padj)") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") +
+  geom_vline(xintercept = c(-0.585, 0.585), linetype = "dashed", color = "black") +
+  ggtitle("HPV- vs HPV+ (treated) ")
+
+# Print the plot
+print(volcano_plot)
+
+ggsave(file.path(PRECLIN_TX_OUT, "volcano_treated_HPVneg_vs_HPVpos.png"),volcano_plot,width = 6, height = 4 )
+```
+
+
+
+```{r include=FALSE}
+
+
+#write.csv(result, file = 'deg_treated_lfchcange1.5.csv', row.names = F)
+padj <- result$padj
+any(padj <0.05)
+result %>%
+  arrange(padj)
+filtered_padj <- filter(result,padj<0.05)
+#write.csv(filtered_padj, file.path(PRECLIN_TX_OUT, "significant_degs_treated_lfc1.5change.csv"))
+dim(filtered_padj)
+```

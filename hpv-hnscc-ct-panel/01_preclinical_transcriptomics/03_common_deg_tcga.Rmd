@@ -1,0 +1,83 @@
+---
+title: "Intersect preclinical (untreated) and TCGA DEG lists"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# Inputs are produced by 01_deseq_hpv.Rmd (preclinical) and
+# 03_tcga_transcriptomics/02_deseq_tcga.Rmd (TCGA).
+source(here::here("config.R"))
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+#finding out the common DEG genes of TCGA 1.5 fc and treated-untreated combined genes of 1.5 fc
+```{r}
+library(dplyr)
+
+# Load the data
+TCGA <- read.csv(file.path(TCGA_TX_OUT, "significant_degs_allsamples_HPVneg_vs_HPVpos_fc1.5change.csv"))
+untreated <- read.csv(file.path(PRECLIN_TX_OUT, "significant_degs_untreated_fc1.5change.csv"))
+
+# Extract the relevant columns and convert to data frames
+untreated_genes <- untreated %>%
+  dplyr::select(gene_symbol, log2FoldChange) %>%
+  as.data.frame()
+
+TCGA_genes <- TCGA %>%
+  dplyr::select(gene_symbol, log2FoldChange) %>%
+  as.data.frame()
+
+# Find common genes based on 'gene_symbol'
+common_genes <- intersect(untreated_genes$gene_symbol, TCGA_genes$gene_symbol)
+
+# Create a new data frame with common genes
+commongenes_untreatedTCGA <- untreated_genes %>%
+  filter(gene_symbol %in% common_genes) %>%
+  arrange(desc(log2FoldChange)) # Arrange by log2FoldChange in descending order
+
+# Create data frames with upregulated and downregulated genes based on log2FoldChange
+upregulated_common <- commongenes_untreatedTCGA %>%
+  filter(log2FoldChange > 0) # Positive log2FoldChange for upregulated
+
+downregulated_common <- commongenes_untreatedTCGA %>%
+  filter(log2FoldChange < 0) # Negative log2FoldChange for downregulated
+downregulated_common <- arrange(downregulated_common, log2FoldChange)
+# Write the data frames to CSV files
+#write.csv(commongenes_untreatedTCGA, "commongenes_untreatedTCGA.csv", row.names = FALSE)
+#write.csv(upregulated_common, "upregulated_common.csv", row.names = FALSE)
+#write.csv(downregulated_common, "downregulated_common.csv", row.names = FALSE)
+
+
+```
+
+
+#Getting the count files from the selected genes
+```{r}
+count_untreated <- read.csv(file.path(PRECLIN_TX_DATA, "count_untreated.csv"))
+count_untreated = aggregate(count_untreated,FUN = max,by=list(count_untreated$Genes))
+count_untreated <- count_untreated[-1,-1]
+count_treated <- read.csv(file.path(PRECLIN_TX_DATA, "count_treated.csv"))
+count_treated = aggregate(count_treated,FUN = max,by=list(count_treated$Genes))
+count_treated <- count_treated[-1,-1]
+
+```
+
+#getting only the target genes count files
+
+```{r}
+# Create new data frames for upregulated and downregulated counts
+upregulated_untreated_counts <- count_untreated %>%
+  filter(Genes %in% upregulated_common$gene_symbol)
+
+downregulated_untreated_counts <- count_untreated %>%
+  filter(Genes %in% downregulated_common$gene_symbol)
+
+upregulated_treated_counts <- count_treated %>%
+  filter(Genes %in% upregulated_common$gene_symbol)
+
+downregulated_treated_counts <- count_treated %>%
+  filter(Genes %in% downregulated_common$gene_symbol)
+
+```
+

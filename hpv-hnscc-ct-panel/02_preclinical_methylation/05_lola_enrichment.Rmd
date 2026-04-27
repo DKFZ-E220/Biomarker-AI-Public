@@ -1,0 +1,140 @@
+---
+title: "LOLA histone-mark enrichment on preclinical differential methylation"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# Uses the LOLA enrichment object produced by RnBeads differential
+# methylation (01_rnbeads_hpv.R). Summarises H3K27me3, H3K9me3 and
+# H3K4me3 signals between HPV+/HPV- and overlays leading-edge genes
+# derived from the GSEA pipeline.
+source(here::here("config.R"))
+library(dplyr)
+library(tidyr)
+library(DESeq2)
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# LOLA enrichment object produced during differential methylation analysis.
+load(file.path(PRECLIN_METH_OUT,
+               "differential_methylation_data",
+               "differential_rnbDiffMeth",
+               "enrichment_lola.RData"))
+
+lola_df <- as.data.frame(
+  diffmeth.lola.enrichment$region[["HPV_Positive vs. HPV_Negative (based on Untreated)"]]$genes
+)
+#write.csv(lola_df, file.path(PRECLIN_METH_OUT, "lola_untreated.csv"))
+```
+
+
+```{r}
+# Select relevant histone marks (H3K27me3, H3K9me3, H3K4me3)
+histone_marks <- c("H3K27me3", "H3K9me3", "H3K4me3")
+
+# Filter LOLA results to keep only selected histone modifications
+histone_lola <- lola_df %>%
+  filter(antibody %in% histone_marks)
+
+# Use `userSet` to classify **hyper** (HPV+) vs **hypo** (HPV-)
+histone_lola <- histone_lola %>%
+  mutate(HPV_Group = ifelse(grepl("hyper", userSet), "HPV_Positive", "HPV_Negative"))
+```
+
+
+```{r}
+histone_lola <- histone_lola %>%
+  mutate(qValue = ifelse(qValue > 0.99, 0.99, qValue),   # Cap large qValues to avoid log(1)
+         qValue = ifelse(qValue < 1e-10, 1e-10, qValue), # Avoid log(0) issues
+         weighted_score = oddsRatio * qValue)            # Compute weighted score
+
+histone_summary <- histone_lola %>%
+  group_by(HPV_Group, antibody) %>%
+  summarise(weighted_histone_score = median(weighted_score, na.rm = TRUE))
+
+print(histone_summary)
+```
+
+
+```{r}
+# Reshape histone summary to wide format
+histone_wide <- histone_summary %>%
+  pivot_wider(names_from = HPV_Group, values_from = weighted_histone_score)
+
+# Initialize results dataframe
+histone_results <- data.frame(Histone_Mark = histone_wide$antibody, P_Value = NA, Test_Type = "Wilcoxon")
+
+# Loop over histone modifications and apply Wilcoxon test
+for (i in 1:nrow(histone_wide)) {
+  data_pos <- histone_wide$HPV_Positive[i]
+  data_neg <- histone_wide$HPV_Negative[i]
+
+  # Perform Wilcoxon test (since we only have summary values)
+  test_result <- wilcox.test(x = data_pos, y = data_neg,
+                             alternative = "two.sided", exact = FALSE)
+
+  # Store p-value
+  histone_results$P_Value[i] <- test_result$p.value
+}
+
+# Adjust for multiple testing (FDR correction)
+histone_results$FDR <- p.adjust(histone_results$P_Value, method = "BH")
+
+# View significant histone modifications (FDR < 0.05)
+significant_histones <- histone_results %>% filter(FDR < 0.05)
+
+print(histone_results)
+print(significant_histones)
+```
+
+
+# Leading-edge gene overlay
+```{r}
+### Filter counts for leading-edge genes and apply VST.
+sig <- read.csv(file.path(PRECLIN_TX_DATA, "countall.csv"))
+sig = aggregate(sig, FUN = max, by = list(sig$Genes))
+sig <- sig[,-1]
+rownames(sig) <- sig$Genes
+sig <- sig[,-1]
+sig <- varianceStabilizingTransformation(object = as.matrix(sig))
+```
+
+```{r}
+# Define leading edge genes
+leadingedge <- c("EREG", "MEI1", "RIBC2", "TCAM1P", "SMC1B", "LY75", "SP9", "ZSCAN23")
+
+# Filter sig matrix for leading edge genes
+leadingedge_data <- sig[rownames(sig) %in% leadingedge, ]
+```
+
+```{r}
+# Define HPV+ and HPV- sample indices
+hpv_neg_samples <- 1:9   # First 9 columns are HPV-negative
+hpv_pos_samples <- 10:18 # Next 9 columns are HPV-positive
+
+# Convert leading edge gene expression to long format
+gene_long <- data.frame(
+  Name         = rownames(leadingedge_data),
+  HPV_Negative = rowMeans(leadingedge_data[, hpv_neg_samples], na.rm = TRUE),
+  HPV_Positive = rowMeans(leadingedge_data[, hpv_pos_samples], na.rm = TRUE),
+  Type         = "Gene"
+)
+print(head(gene_long))
+```
+
+```{r}
+# Convert histone summary to long format
+histone_long <- histone_summary %>%
+  rename(Name = antibody) %>%
+  pivot_wider(names_from = HPV_Group, values_from = weighted_histone_score) %>%
+  mutate(Type = "Histone")
+
+print(head(histone_long))
+```
+
+```{r}
+# Combine genes and histones in a single dataframe
+combined_data <- bind_rows(gene_long, histone_long)
+print(head(combined_data))
+```

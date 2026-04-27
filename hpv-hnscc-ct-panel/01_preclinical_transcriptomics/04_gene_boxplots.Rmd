@@ -1,0 +1,194 @@
+---
+title: "Per-gene boxplots and non-/parametric tests across cell lines"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# Per-gene Shapiro test followed by t-test/Wilcoxon (HPV+/-)
+# and ANOVA/Kruskal (cell lines). Inputs come from PRECLIN_TX_DATA.
+source(here::here("config.R"))
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+######using same analyses with vst normalization
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(ggpubr)
+library(DESeq2)
+library(FSA)
+# Load data
+count_data <- read.csv(file.path(PRECLIN_TX_DATA, "countall.csv"))
+count_data = aggregate(count_data,FUN = max,by=list(count_data$Genes))
+count_data <- count_data[,-1]
+Metadata <- read.csv(file.path(PRECLIN_TX_DATA, "Metadata_HNSCC.csv"))
+rownames(Metadata) <- Metadata$Sample
+rownames(count_data) <- count_data$Genes
+count_data <- count_data [,-1]
+
+# Apply VST
+vst_data <- varianceStabilizingTransformation(as.matrix(count_data))
+vst_df <- as.data.frame(vst_data)
+
+# Assuming vst_df has been created as shown in previous steps
+Metadata_ordered <- Metadata[match(colnames(vst_df), rownames(Metadata)),]
+vst_long <- cbind.data.frame(t(vst_df), Metadata_ordered)
+
+
+# Combine with metadata
+vst_all <- cbind(vst_long, Metadata_ordered)
+
+# Define genes of interest
+#genes <- c("TP53", "MAGEA3", "MAGEA6", "MAGEA4", "PTPRD", "NDN", "ZNF214", "SALL1", "ZPBP2")
+genes <- c("EREG", "MEI1", "RIBC2", "TCAM1P", "SMC1B", "LY75", "SP9", "ZSCAN23"
+   )
+# Convert to long format for faceting
+long_data <- vst_all %>%
+  pivot_longer(cols = all_of(genes), names_to = "Gene", values_to = "Expression")
+```
+
+
+```{r}
+analyze_and_plot <- function(gene_data, gene_name) {
+  # Subset data for the current gene
+  gene_df <- gene_data %>% filter(Gene == gene_name)
+  
+  cat("\n\n### Analysis for Gene:", gene_name, "###\n")
+  
+  # Shapiro test
+  shapiro_res <- shapiro.test(gene_df$Expression)
+  cat("\nShapiro-Wilk normality test:\n")
+  print(shapiro_res)
+  
+  # Determine if the data is normally distributed based on Shapiro-Wilk test
+  if (shapiro_res$p.value > 0.05) {
+    cat("\nData is normally distributed. Performing parametric tests (ANOVA, Tukey HSD, t-test).\n")
+    
+    # T-test
+    ttest_res <- t.test(Expression ~ HPV, data = gene_df)
+    cat("\nWelch Two Sample t-test:\n")
+    print(ttest_res)
+    
+    # Boxplot + t-test
+    plot_ttest <- gene_df %>%
+      ggplot(aes(x = HPV, y = Expression)) +
+      geom_boxplot(aes(fill = HPV), outlier.shape = 15, outlier.colour = "black", width = 0.5, alpha = .5) +
+      geom_jitter(aes(color = HPV), size = 0.6, alpha = 0.9) +
+      xlab("HPV") + theme_classic() +
+      stat_compare_means(method = "t.test") + 
+      scale_fill_manual(values = c("#E69F00", "#56B4E9")) +
+      ggtitle(paste("Gene:", gene_name))
+    print(plot_ttest)
+    
+    # ANOVA
+    anova_res <- aov(Expression ~ Cell_Line, data = gene_df)
+    cat("\nANOVA results:\n")
+    print(summary(anova_res))
+    
+    # TukeyHSD
+    tukey_res <- TukeyHSD(anova_res)
+    cat("\nTukeyHSD post-hoc test:\n")
+    print(tukey_res)
+    
+    # Boxplot + ANOVA
+    plot_anova <- gene_df %>%
+      ggplot(aes(x = Cell_Line, y = Expression)) +
+      geom_boxplot(aes(fill = HPV), outlier.shape = 15, outlier.colour = "black", width = 0.5, alpha = .5) +
+      geom_jitter(aes(color = Cell_Line), size = 0.6, alpha = 0.9) +
+      xlab("Cell Line") + theme_classic() +
+      stat_compare_means(method = "anova") +
+      scale_fill_manual(values = c("#E69F00", "#56B4E9")) +
+      ggtitle(paste("Gene:", gene_name))
+    print(plot_anova)
+    
+  } else {
+    cat("\nData is not normally distributed. Performing non-parametric tests (Wilcoxon, Kruskal-Wallis, Dunn).\n")
+    
+    # Wilcoxon test
+    wilcox_res <- wilcox.test(Expression ~ HPV, data = gene_df)
+    cat("\nWilcoxon rank-sum test:\n")
+    print(wilcox_res)
+    
+    # Boxplot + Wilcoxon test
+    plot_wilcox <- gene_df %>%
+      ggplot(aes(x = HPV, y = Expression)) +
+      geom_boxplot(aes(fill = HPV), outlier.shape = 15, outlier.colour = "black", width = 0.5, alpha = .5) +
+      geom_jitter(aes(color = HPV), size = 0.6, alpha = 0.9) +
+      xlab("HPV") + theme_classic() +
+      stat_compare_means(method = "wilcox.test") + 
+      scale_fill_manual(values = c("#E69F00", "#56B4E9")) +
+      ggtitle(paste("Gene:", gene_name))
+    print(plot_wilcox)
+    
+    # Kruskal-Wallis test
+    kruskal_res <- kruskal.test(Expression ~ Cell_Line, data = gene_df)
+    cat("\nKruskal-Wallis test:\n")
+    print(kruskal_res)
+    
+    # Dunn post-hoc test
+    dunn_res <- dunnTest(Expression ~ Cell_Line, data = gene_df, method = "bh")
+    cat("\nDunn post-hoc test:\n")
+    print(dunn_res)
+    
+    # Boxplot + Kruskal-Wallis test
+    plot_kruskal <- gene_df %>%
+      ggplot(aes(x = Cell_Line, y = Expression)) +
+      geom_boxplot(aes(fill = HPV), outlier.shape = 15, outlier.colour = "black", width = 0.5, alpha = .5) +
+      geom_jitter(aes(color = Cell_Line), size = 0.6, alpha = 0.9) +
+      xlab("Cell Line") + theme_classic() +
+      stat_compare_means(method = "kruskal.test") +
+      scale_fill_manual(values = c("#E69F00", "#56B4E9")) +
+      ggtitle(paste("Gene:", gene_name))
+    print(plot_kruskal)
+  }
+  
+  # Boxplot + Wilcoxon test (treatment arm)
+  plot_treatment_arm <- gene_df %>%
+    ggplot(aes(x = Group, y = Expression)) +
+    geom_boxplot(aes(fill = HPV), outlier.shape = 15, outlier.colour = "black", width = 0.5, alpha = .5) +
+    geom_jitter(aes(color = Cell_Line), size = 0.6, alpha = 0.9) +
+    xlab("HPV") + theme_classic() + 
+    stat_compare_means(method = ifelse(shapiro_res$p.value > 0.05, "t.test", "wilcox.test")) + 
+    scale_fill_manual(values = c("#E69F00", "#56B4E9")) +
+    ggtitle(paste("Gene:", gene_name))
+  print(plot_treatment_arm)
+  
+  return(list(
+    gene_name = gene_name, 
+    shapiro_res = shapiro_res, 
+    ttest_res = if (exists("ttest_res")) ttest_res else NULL, 
+    wilcox_res = if (exists("wilcox_res")) wilcox_res else NULL, 
+    anova_res = if (exists("anova_res")) summary(anova_res) else NULL, 
+    tukey_res = if (exists("tukey_res")) tukey_res else NULL, 
+    kruskal_res = if (exists("kruskal_res")) kruskal_res else NULL, 
+    dunn_res = if (exists("dunn_res")) dunn_res else NULL
+  ))
+}
+
+```
+
+
+```{r}
+# Initialize an empty list to store results
+results_list <- list()
+
+# Open a PDF device
+pdf(file.path(PRECLIN_TX_OUT, "comparisoncelllines_plot.pdf"), width = 8, height = 6)
+
+# Apply function to each gene and store the results
+for (gene in genes) {
+  result <- analyze_and_plot(long_data, gene)
+  results_list[[gene]] <- result
+  
+  # If the result is a ggplot object, print it to the PDF
+  if (inherits(result, "ggplot")) {
+    print(result)
+  }
+}
+
+# Close the PDF device
+dev.off()
+
+```

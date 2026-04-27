@@ -1,0 +1,181 @@
+---
+title: "TCGA-HNSC DESeq2 — HPV+ vs HPV-"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# DESeq2 differential expression between HPV+ and HPV- tumours
+# on the full TCGA-HNSC cohort. Inputs: count matrix + harmonised
+# metadata under TCGA_TX_DATA. Outputs: DEG tables under TCGA_TX_OUT.
+source(here::here("config.R"))
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+# 1. Aim
+
+## Generating Count files for all 487 samples of TCGA with HPV status
+
+
+# 2. Loading packages 
+
+```{r message=FALSE, warning=FALSE, include=FALSE, results='hide'}
+library(DESeq2)
+library(ashr) #in order to shrink logFC if we use contrasts instead of coefficients to retrieve results
+library(tidyverse)
+library(ggplot2)
+library(readxl)
+library(pheatmap)
+library(tibble)
+library(dplyr)
+```
+
+
+# 3. Making input files ready for deseq2, start with whole comparison
+
+```{r message=FALSE, warning=FALSE, include=FALSE, results='hide'}
+Matrix = read.csv(file.path(TCGA_TX_DATA, "Countsprimarytumormodified.csv"))
+colnames(Matrix)[1] <- "Genes"
+attach(Matrix)
+#if we target the mean of counts
+#Matrix = aggregate(Matrix,FUN = mean,by=list(Matrix$Genes))
+
+#if we a trget max of counts
+Matrix = aggregate(Matrix,FUN = max,by=list(Matrix$Genes))
+Matrix <- Matrix[,-1]
+
+#write.csv(Matrix, "Maxcountall_TCGA.csv")
+```
+
+
+```{r message=FALSE, warning=FALSE, include=FALSE, results='hide'}
+#setting the row names (genes) for each samples
+
+HNSCC_matrix = Matrix[,-1]
+rownames(HNSCC_matrix) = Matrix[,1]
+
+#input of the metadata
+Metadata = read.csv(file.path(TCGA_TX_DATA, "TCGA_metadata_GDC_RPB_combined.csv"))
+rownames(Metadata) <- Metadata[,1]
+Metadata = subset(Metadata, select = -1 )
+```
+
+#filtration fo metadata according to HPV subtype
+```{r message=FALSE, warning=FALSE, include=FALSE, results='hide'}
+#removing rows without HPV status
+
+Metadata <- Metadata %>%
+  filter(!is.na(Subtype))
+
+# Find common row names in Metadata and column names in HNSCC_matrix
+common_names <- intersect(rownames(Metadata), colnames(HNSCC_matrix))
+
+# Subset Metadata to include only the common row names
+Metadata <- Metadata[common_names, ]
+HNSCC_matrix <- HNSCC_matrix[,common_names]
+# Replace 'HNSC_HPV-' with 'HPV_Negative'
+Metadata$Subtype <- gsub("HNSC_HPV-", "HPV_Negative", Metadata$Subtype)
+
+
+# Replace 'HNSC_HPV+' with 'HPV_Positive', here i need to use 3rd bracket for + otherwise the + remains, stupid.
+Metadata$Subtype <- gsub("HNSC_HPV[+]", "HPV_Positive", Metadata$Subtype)
+
+# Order Metadata according to the order of common_names as they appear in HNSCC_matrix
+Metadata <- Metadata[common_names[order(match(common_names, colnames(HNSCC_matrix)))], ]
+
+#if the row names of metadata is in same seq as column of matrix
+all(rownames(Metadata) == colnames(HNSCC_matrix))
+
+
+```
+
+# Create DESeq object
+```{r message=FALSE, warning=FALSE, include=FALSE, results='hide'}
+dds_wt <- DESeqDataSetFromMatrix(countData = round(HNSCC_matrix),
+                                 colData = Metadata,
+                                 design = ~ Subtype)
+```
+
+
+#keeping genes with count values >= 10
+```{r message=FALSE, warning=FALSE, include=FALSE, results='hide'}
+keep <- rowSums(counts(dds_wt)) >= 10
+dds_wt <- dds_wt[keep,]
+#Count normalization---> calculation
+dds_wt <- estimateSizeFactors(dds_wt)
+sizeFactors(dds_wt)
+
+#Count normalization---> extraction
+normalized_wt_counts <- counts(dds_wt, normalized=TRUE)
+#write.csv(normalized_wt_counts,'HPV_all_normalized.csv')
+
+```
+
+
+
+
+# Run analysis for fold change of 3
+```{r echo=TRUE}
+dds_wt <- DESeq(dds_wt)
+
+wt_res <- results(dds_wt,
+                  contrast = c("Subtype", "HPV_Positive",
+                               "HPV_Negative"),
+                  alpha = 0.05,
+                  lfcThreshold = 1.58)
+wt_res
+
+result = data.frame(wt_res)
+
+
+
+# Create a new column 'gene_symbol' with row names (gene names)
+  result$gene_symbol <- rownames(result)
+  # Optionally, if you want 'gene_symbol' to be the first column
+  result <- result[, c("gene_symbol", setdiff(names(result), "gene_symbol"))]
+
+write.csv(result, file = file.path(TCGA_TX_OUT, 'deg_HPVneg_vs_HPVpos_lfcchange3.csv'), row.names = FALSE)
+
+##get only the significant values
+padj <- result$padj
+any(padj <0.05)
+result %>%
+  arrange(padj)
+filtered_padj <- filter(result,padj<0.05)
+
+write.csv(filtered_padj, file.path(TCGA_TX_OUT, "significant_degs_allsamples_HPVneg_vs_HPVpos_lfc3change.csv"), row.names = FALSE)
+dim(filtered_padj)
+```
+
+# Run analysis for fold change of 1.5
+```{r echo=TRUE}
+dds_wt <- DESeq(dds_wt)
+
+wt_res <- results(dds_wt,
+                  contrast = c("Subtype", "HPV_Positive",
+                               "HPV_Negative"),
+                  alpha = 0.05,
+                  lfcThreshold = 0.585)
+wt_res
+
+result = data.frame(wt_res)
+
+
+
+# Create a new column 'gene_symbol' with row names (gene names)
+  result$gene_symbol <- rownames(result)
+  # Optionally, if you want 'gene_symbol' to be the first column
+  result <- result[, c("gene_symbol", setdiff(names(result), "gene_symbol"))]
+
+write.csv(result, file = file.path(TCGA_TX_OUT, 'deg_HPVneg_vs_HPVpos_fcchange1.5.csv'), row.names = FALSE)
+
+##get only the significant values
+padj <- result$padj
+any(padj <0.05)
+result %>%
+  arrange(padj)
+filtered_padj <- filter(result,padj<0.05)
+
+write.csv(filtered_padj, file.path(TCGA_TX_OUT, "significant_degs_allsamples_HPVneg_vs_HPVpos_fc1.5change.csv"), row.names = FALSE)
+dim(filtered_padj)
+```

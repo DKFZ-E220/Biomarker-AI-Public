@@ -1,0 +1,1276 @@
+---
+title: "DKTK-ROG validation: K-means clustering + survival analysis"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# K-means clustering (k = 3) of the DKTK-ROG adjuvant radio(chemo)therapy
+# cohort on the 5-gene CT panel, followed by OS / LRR / DMFS survival
+# analysis, Cox models (C-index, LRT) and TP53/P53-stratified figures.
+source(here::here("config.R"))
+knitr::opts_chunk$set(fig.width = 14, fig.height = 8)
+library(oligo)
+library(biomaRt)
+library(dplyr)
+library(stringr)
+library(Rlabkey)
+library(pheatmap)
+library(ggplot2)
+library(reshape2)
+library(survival)
+library(survminer)
+library(forestplot)
+library(purrr)  
+library(Hmisc)
+library(tidyr)
+library(rstatix)  
+library(car) 
+library(ggpubr)  
+library(viridis)
+library(limma)
+library(readxl)
+library(tableone)
+library(gridExtra)
+library(cluster)
+library(data.table)
+```
+
+# Load and preprocess expression data
+
+```{r}
+load(file = file.path(DKTK_DATA, "datarma.rda"))
+boxplot(exprs(data.rma))
+```
+
+```{r}
+probesets <- rownames(data.rma) 
+probesets.corr <- gsub("\\.1", "", probesets)
+rownames(data.rma) <- probesets.corr
+fData(data.rma) <- as.data.frame(probesets.corr)
+```
+
+```{r}
+ensembl <- biomaRt::useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+annotLookup <- biomaRt::getBM(attributes = c("affy_hta_2_0",
+                              "ensembl_gene_id",
+                              "external_gene_name"
+                            ),
+               filters = "with_affy_hta_2_0",
+               values = TRUE,
+               mart = ensembl) 
+```
+
+```{r}
+indicesLookup <- match(probesets.corr, annotLookup$affy_hta_2_0)
+indicesLookup <- data.frame(probesets.corr, annotLookup[indicesLookup,])
+
+indicesLookup$control <- ifelse(
+  is.na(indicesLookup$external_gene_name),
+  ifelse(grepl("(TC.*hg)", probesets.corr), 
+         FALSE, 
+         TRUE),
+  FALSE)
+
+data_dktk.final <- subset(data.rma, !indicesLookup$control)
+```
+
+```{r}
+fData(data_dktk.final) <- left_join(fData(data_dktk.final), indicesLookup[1:4])
+```
+
+```{r}
+result <- tibble(fData(data_dktk.final)$probesets.corr, 
+                 fData(data_dktk.final)$external_gene_name, 
+                 .name_repair = ~ c("Probeset", "External_gene_name"))
+result <- bind_cols(result, as_tibble(exprs(data_dktk.final)))
+
+format_sample_id <- function(id) {
+  prefix <- gsub("(DKTKRO1[ab])(\\d+)", "\\1", id)
+  num <- gsub("(DKTKRO1[ab])(\\d+)", "\\2", id)
+  num_padded <- stringr::str_pad(num, width = 3, pad = "0")
+  formatted_id <- paste0(prefix, num_padded)
+  return(formatted_id)
+}
+
+original_colnames <- colnames(result)
+new_colnames <- gsub("(.+)\\.CEL", "DKTKRO1\\1", original_colnames)
+formatted_colnames <- sapply(new_colnames, format_sample_id)
+colnames(result) <- formatted_colnames
+result <- result %>%
+  dplyr::rename(Probeset = ProbesetProbeset, External_gene_name = External_gene_nameExternal_gene_name)
+```
+
+```{r}
+data_dktk <- result
+data_dktk <- data_dktk %>% filter(External_gene_name != "")
+```
+
+```{r}
+data_dktk <- data.table::data.table(data_dktk)
+
+nondups <- data_dktk[!(
+  duplicated(data_dktk, by = "External_gene_name") | 
+    duplicated(data_dktk, fromLast = TRUE, by="External_gene_name")
+),]
+dups <- data_dktk[(
+  duplicated(data_dktk, by = "External_gene_name") | 
+                 duplicated(data_dktk, fromLast = TRUE, by="External_gene_name")
+),]
+
+log_median <- function(x) {
+  n <- length(x)
+  s <- sort(x)
+  r <- 0:1
+  ifelse(n %% 2 == 1, 
+         s[(n+1)/2], 
+         exp(median(log(s[n/2+r])))
+  )
+}
+
+patient_cols <- which(!(colnames(dups) %in% c("Probeset", "External_gene_name")))
+
+cat("\n=== Validating log_median Function ===\n")
+
+even_example <- dups %>% 
+    group_by(External_gene_name) %>% 
+    filter(External_gene_name == "TP53") %>%
+    ungroup()
+
+if (nrow(even_example) > 0) {
+  test_col <- colnames(even_example)[3]
+  test_values <- even_example[[test_col]]
+  
+  standard_median <- median(test_values)
+  geometric_median <- log_median(test_values)
+  
+  cat("Even entries test (TP53):\n")
+  cat("  Sample size:", length(test_values), "\n")
+  cat("  Arithmetic median:", standard_median, "\n")
+  cat("  Geometric median:", geometric_median, "\n")
+  cat("  Are they different?", !isTRUE(all.equal(standard_median, geometric_median)), "\n\n")
+}
+
+odd_example <- dups %>% 
+    group_by(External_gene_name) %>% 
+    filter(External_gene_name == "SLC5A1") %>%
+    ungroup()
+
+if (nrow(odd_example) > 0) {
+  test_col <- colnames(odd_example)[3]
+  test_values <- odd_example[[test_col]]
+  
+  standard_median <- median(test_values)
+  geometric_median <- log_median(test_values)
+  
+  cat("Odd entries test (SLC5A1):\n")
+  cat("  Sample size:", length(test_values), "\n")
+  cat("  Arithmetic median:", standard_median, "\n")
+  cat("  Geometric median:", geometric_median, "\n")
+  cat("  Are they equal?", isTRUE(all.equal(standard_median, geometric_median)), "\n\n")
+}
+
+cat("✓ log_median function validated - proceeding with aggregation\n\n")
+
+dups <- dups %>% 
+  group_by(External_gene_name) %>%
+  summarise_at(.vars = names(.)[patient_cols],
+               .funs = log_median)
+
+data_dktk <- rbind(nondups[,-1], dups)
+```
+
+# Load clinical data
+
+```{r}
+dktk_adjuvant <- read.csv(file.path(DKTK_DATA, "dktk_adjuvant.csv"), check.names = FALSE)
+
+samples <- colnames(data_dktk)[-1]
+
+dktk_adjuvant_microarray <- dktk_adjuvant %>%
+  filter(`Participant ID` %in% samples)
+```
+
+# Prepare expression and metadata for adjuvant cohort
+
+```{r}
+metadata_adjuvant <- as.data.frame(dktk_adjuvant_microarray)
+rownames(metadata_adjuvant) <- metadata_adjuvant[,1]
+metadata_adjuvant <- metadata_adjuvant[, -1]
+
+data_adjuvant <- as.data.frame(data_dktk)
+rownames(data_adjuvant) <- data_adjuvant[,1]
+data_adjuvant <- data_adjuvant[,-1]
+
+common_row_names <- intersect(colnames(data_adjuvant), rownames(metadata_adjuvant))
+data_adjuvant <- data_adjuvant[, common_row_names]
+
+expression_data_adjuvant <- data.frame(lapply(data_adjuvant, as.numeric), row.names = rownames(data_adjuvant))
+expression_data_adjuvant_t <- t(expression_data_adjuvant)
+
+if(any(duplicated(rownames(expression_data_adjuvant)))) {
+  warning("Duplicated row names found in expression_data_adjuvant.")
+}
+
+if(any(is.na(expression_data_adjuvant))) {
+  warning("Non-numeric data found and converted to NA.")
+}
+
+metadata_adjuvant <- metadata_adjuvant[match(colnames(expression_data_adjuvant), rownames(metadata_adjuvant)), ]
+```
+
+# K-means clustering on CT panel genes
+
+```{r}
+final_gene <- c("RIBC2", "SMC1B", "TCAM1P", "STAG3", "SYCP2")
+
+scaled_patients <- scale(expression_data_adjuvant_t[, final_gene], center = TRUE, scale = TRUE)
+apply(scaled_patients, 2, var)
+
+kmeans_clustering <- function(data) {
+  set.seed(42)
+  kmeans_result <- kmeans(data, centers = 3, nstart = 100, iter.max = 10, algorithm = "Hartigan-Wong")
+  cluster_means <- tapply(rowMeans(data), kmeans_result$cluster, mean)
+  
+  if (cluster_means[1] > cluster_means[2] && cluster_means[1] > cluster_means[3]) {
+    high <- 1; medium <- ifelse(cluster_means[2] > cluster_means[3], 2, 3); low <- ifelse(cluster_means[2] > cluster_means[3], 3, 2)
+  } else if (cluster_means[2] > cluster_means[1] && cluster_means[2] > cluster_means[3]) {
+    high <- 2; medium <- ifelse(cluster_means[1] > cluster_means[3], 1, 3); low <- ifelse(cluster_means[1] > cluster_means[3], 3, 1)
+  } else {
+    high <- 3; medium <- ifelse(cluster_means[1] > cluster_means[2], 1, 2); low <- ifelse(cluster_means[1] > cluster_means[2], 2, 1)
+  }
+  
+  cluster <- as.factor(kmeans_result$cluster)
+  levels(cluster)[high] <- "High CT Panel Expression"
+  levels(cluster)[medium] <- "Intermediate CT Panel Expression"
+  levels(cluster)[low] <- "Low CT Panel Expression"
+  
+  return(list(cluster_labels = cluster, centroids = kmeans_result$centers))
+}
+
+clustering_results <- kmeans_clustering(scaled_patients[, final_gene])
+expression_data_adjuvant_t <- as.data.frame(expression_data_adjuvant_t)
+expression_data_adjuvant_t <- tibble::rownames_to_column(expression_data_adjuvant_t, "Patient_ID")
+expression_data_adjuvant_t$DEG.kmeans <- clustering_results$cluster_labels
+
+group_means <- aggregate(rowMeans(scaled_patients), 
+                         by = list(expression_data_adjuvant_t$DEG.kmeans), 
+                         mean)
+colnames(group_means) <- c("Group", "Overall_Mean_Expression")
+print(group_means)
+
+table(expression_data_adjuvant_t$DEG.kmeans)
+```
+
+# Plot: Mean expression by cluster
+
+```{r}
+cluster <- cbind(scaled_patients[, final_gene], expression_data_adjuvant_t[, c("DEG.kmeans", "Patient_ID")])
+dfm <- reshape2::melt(cluster, variable.name = "Gene", value.name = "Expression")
+dfm_summary <- dfm %>% 
+  dplyr::group_by(Gene, DEG.kmeans) %>% 
+  dplyr::summarize(n = n(),
+                   Mean = mean(Expression), 
+                   sd = sd(Expression),
+                   se = sd / sqrt(n),
+                   .groups = "drop")
+
+p <- ggplot(dfm_summary, aes(x = Gene, y = Mean, fill = DEG.kmeans)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_errorbar(aes(ymin = Mean - se, ymax = Mean + se),
+                width = 0.2, position = position_dodge(0.9)) +
+  scale_fill_manual(values = c("High CT Panel Expression" = "#7AB2D3", 
+                               "Intermediate CT Panel Expression" = "#E7B800", 
+                               "Low CT Panel Expression" = "#DE3163")) +
+  coord_flip() +
+  facet_grid(rows = vars(DEG.kmeans)) +
+  theme_bw() +
+  theme(axis.text = element_text(size = 10, face = "bold.italic"),
+        axis.text.x = element_text(size = 10),
+        axis.title = element_text(size = 10, face = "bold"),
+        legend.position = "none",
+        strip.text = element_text(size = 10),
+        plot.title = element_text(size = 10, hjust = 0.5, face = "bold")) +
+  ggtitle("Mean expression value of patients clustered \n into 'High/Intermediate/Low CT Panel Expression' groups")
+
+print(p)
+```
+
+# Silhouette plot for validation
+
+```{r}
+cluster_numeric <- as.numeric(expression_data_adjuvant_t$DEG.kmeans)
+sil <- silhouette(cluster_numeric, dist(scaled_patients))
+plot(sil, main = "Silhouette Plot for K-means Clusters (k = 3)")
+cat("Average silhouette width:", mean(sil[, 3]), "\n")
+```
+
+# PCA plot for validation
+
+```{r}
+pca <- prcomp(scaled_patients, center = TRUE, scale. = TRUE)
+
+pca_df <- data.frame(
+  PC1 = pca$x[, 1],
+  PC2 = pca$x[, 2],
+  cluster = expression_data_adjuvant_t$DEG.kmeans
+)
+
+ggplot(pca_df, aes(x = PC1, y = PC2, color = cluster)) +
+  geom_point(size = 3) +
+  theme_minimal() +
+  labs(
+    title = "PCA Projection of CT Panel Clusters (k = 3)",
+    x = "Principal Component 1",
+    y = "Principal Component 2",
+    color = "Cluster"
+  )
+```
+
+# Molecular subtyping (correlation-based)
+
+```{r}
+median_center <- function(x) { x - median(x, na.rm = TRUE) }
+
+dktk_adjuvant_median <- t(apply(expression_data_adjuvant, 1, median_center))
+
+centroid_values <- read_excel(file.path(DKTK_DATA, 'updated_centroid_values.xlsx'), sheet = 'Sheet1')
+centroid_values <- as.data.frame(centroid_values)
+rownames(centroid_values) <- centroid_values$Gene_Symbol
+centroid_values <- centroid_values[, -1]
+
+common_genes <- intersect(rownames(dktk_adjuvant_median), rownames(centroid_values))
+filtered_dktk_adjuvant_median <- dktk_adjuvant_median[common_genes, ]
+filtered_centroid_values <- centroid_values[common_genes, ]
+
+if (!identical(rownames(filtered_dktk_adjuvant_median), rownames(filtered_centroid_values))) {
+  warning("Gene names do not match between expression and centroid data!")
+}
+
+num_samples <- ncol(filtered_dktk_adjuvant_median)
+num_centroids <- ncol(filtered_centroid_values)
+correlation_matrix <- matrix(NA, nrow = num_samples, ncol = num_centroids,
+                             dimnames = list(colnames(filtered_dktk_adjuvant_median), 
+                                             colnames(filtered_centroid_values)))
+
+for (i in 1:num_samples) {
+  for (j in 1:num_centroids) {
+    correlation_matrix[i, j] <- cor(filtered_dktk_adjuvant_median[, i],
+                                    filtered_centroid_values[, j], method = "pearson")
+  }
+}
+
+assigned_clusters <- apply(correlation_matrix, 1, function(row) {
+  if (max(row) > 0.2 && (max(row) - sort(row, decreasing = TRUE)[2]) > 0.2) {
+    return(which.max(row))
+  } else {
+    return(NA)
+  }
+})
+assigned_cluster_names <- ifelse(is.na(assigned_clusters), "Heterogeneous Subtypes",
+                                 colnames(filtered_centroid_values)[assigned_clusters])
+final_result_dktk_adjuvant <- data.frame(Sample = colnames(filtered_dktk_adjuvant_median), 
+                                         Subtype = assigned_cluster_names)
+print(table(final_result_dktk_adjuvant$Subtype))
+```
+
+# Heatmap preparation
+
+```{r}
+clusters_elastic_adjuvant <- cluster[, c("DEG.kmeans", "Patient_ID")]
+
+metadata_adjuvant$sample_id <- rownames(metadata_adjuvant)
+merged_df <- merge(metadata_adjuvant, clusters_elastic_adjuvant, 
+                   by.x = "sample_id", by.y = "Patient_ID", all.x = TRUE)
+
+kmeans_columns <- setdiff(colnames(merged_df), colnames(metadata_adjuvant))
+merged_df[kmeans_columns][is.na(merged_df[kmeans_columns])] <- "NA"
+rownames(merged_df) <- merged_df$sample_id
+merged_df <- merged_df[, -1]
+metadata_adjuvant <- merged_df
+
+matching_rows <- intersect(rownames(metadata_adjuvant), rownames(final_result_dktk_adjuvant))
+merged_df_matched <- metadata_adjuvant[matching_rows, ]
+final_result_matched <- final_result_dktk_adjuvant[matching_rows, ]
+merged_df <- cbind(merged_df_matched, final_result_matched)
+metadata_adjuvant <- merged_df
+```
+
+# Heatmap with clustering
+
+```{r}
+metadata_adjuvant_filtered <- metadata_adjuvant
+
+selected_data <- expression_data_adjuvant[rownames(expression_data_adjuvant) %in% final_gene, ]
+
+metadata_adjuvant_filtered <- metadata_adjuvant_filtered[, c(4,7,14,16,18,22,23,24,30,34,36,38,40,48,103,105,110,112)]
+
+sample_order <- order(metadata_adjuvant_filtered$DEG.kmeans)
+metadata_adjuvant_filtered <- metadata_adjuvant_filtered[sample_order, ]
+
+selected_data <- selected_data[, match(rownames(metadata_adjuvant_filtered), colnames(selected_data))]
+
+selected_data <- selected_data[, colSums(is.na(selected_data)) == 0]
+
+selected_data <- t(scale(t(selected_data)))
+
+breaksList = seq(-1, 1, by = 0.0001)
+
+dktk_adjuvant_filtered_heatmap <- pheatmap(selected_data,  show_colnames = F, 
+         show_rownames = T,
+         annotation_col = metadata_adjuvant_filtered,
+         annotation_colors = NA,
+         clustering_distance_cols = 'euclidean',
+         clustering_distance_rows = 'euclidean',
+         breaks = breaksList,
+         color = colorRampPalette(c("navy", "white", "firebrick3"))(length(breaksList)-1),
+         cluster_cols = T,
+         cluster_rows = T,
+         border_color = "black",fontsize_row = 12
+         )
+```
+
+# Heatmap ordered (no clustering)
+
+```{r}
+dktk_adjuvant_filtered_heatmap <- pheatmap(selected_data,  show_colnames = F, 
+         show_rownames = T,
+         annotation_col = metadata_adjuvant_filtered,
+         annotation_colors = NA,
+         clustering_distance_cols = 'euclidean',
+         clustering_distance_rows = 'euclidean',
+         breaks = breaksList,
+         color = colorRampPalette(c("navy", "white", "firebrick3"))(length(breaksList)-1),
+         cluster_cols = F,
+         cluster_rows = T,
+         border_color = "black",fontsize_row = 12
+         )
+```
+
+# Heatmap with detection methods
+
+```{r}
+colnames(metadata_adjuvant_filtered)[colnames(metadata_adjuvant_filtered) == "clusters_elastic_adjuvant"] <- "K-means cluster"
+colnames(metadata_adjuvant_filtered)[colnames(metadata_adjuvant_filtered) == "HPV16 DNS"]            <- "HPV16 DNA"
+colnames(metadata_adjuvant_filtered)[colnames(metadata_adjuvant_filtered) == "DEG.kmeans"]           <- "K-means cluster"
+
+metadata_adjuvant_filtered$P53[metadata_adjuvant_filtered$P53 == 0] <- "Negative"
+metadata_adjuvant_filtered$P53[metadata_adjuvant_filtered$P53 == 1] <- "Positive"
+
+metadata_adjuvant_filtered$`HPV16 RNA`[metadata_adjuvant_filtered$`HPV16 RNA` == 0] <- "Negative"
+metadata_adjuvant_filtered$`HPV16 RNA`[metadata_adjuvant_filtered$`HPV16 RNA` == 1] <- "Positive"
+
+metadata_adjuvant_filtered$`HPV16 DNA`[metadata_adjuvant_filtered$`HPV16 DNA` == 0] <- "Negative"
+metadata_adjuvant_filtered$`HPV16 DNA`[metadata_adjuvant_filtered$`HPV16 DNA` == 1] <- "Positive"
+
+metadata_adjuvant_filtered$P16[metadata_adjuvant_filtered$P16 == 0] <- "Negative"
+metadata_adjuvant_filtered$P16[metadata_adjuvant_filtered$P16 == 1] <- "Positive"
+
+metadata_adjuvant_filtered_detection <- metadata_adjuvant_filtered[, c(10:12, 17, 18)]
+
+ann_colors_viridis <- list(
+  `K-means cluster` = c("High CT Panel Expression" = "#7AB2D3",
+                        "Intermediate CT Panel Expression" = "#E7B800",
+                        "Low CT Panel Expression" = "#DE3163"),
+  `HPV16 RNA`      = c("Negative" = "#f7fcf0", "Positive" = "#00441b"),
+  `HPV16 DNA`      = c("Negative" = "#ece7f2", "Positive" = "#2b8cbe"),
+  P16              = c("Negative" = "#fde0dd", "Positive" = "#7a0177"),
+  `Subtype`        = c("Atypical" = viridis(3)[1],
+                       "Mesenchymal" = viridis(3)[2],
+                       "Classical" = viridis(3)[3],
+                       "Basal" = "blue", 
+                       "Heterogeneous Subtypes" = viridis(3)[6])
+)
+
+metadata_adjuvant_filtered_detection$`K-means cluster` <- factor(
+  metadata_adjuvant_filtered_detection$`K-means cluster`,
+  levels = c("High CT Panel Expression", "Intermediate CT Panel Expression", "Low CT Panel Expression")
+)
+
+ordered_samples <- rownames(metadata_adjuvant_filtered_detection)[order(metadata_adjuvant_filtered_detection$`K-means cluster`)]
+selected_data_ordered <- selected_data[, ordered_samples]
+
+q <- dktk_adjuvant_filtered_heatmap_viridis <- pheatmap(
+  selected_data_ordered,  
+  show_colnames = FALSE, 
+  show_rownames = TRUE,
+  annotation_col = metadata_adjuvant_filtered_detection,
+  annotation_colors = ann_colors_viridis,
+  clustering_distance_cols = "euclidean",
+  clustering_distance_rows = "euclidean",
+  cluster_cols = FALSE,
+  cluster_rows = TRUE,
+  border_color = "black",
+  fontsize_row = 16
+)
+```
+
+# Prepare data for survival analysis
+
+```{r}
+ct_palette <- c("#7AB2D3", "#E7B800", "#DE3163")
+
+LTC_adjuvant <- read.csv(file.path(DKTK_DATA, "adjuvant_merged.csv"))
+
+clusters_df <- data.frame(Participant.ID = rownames(cluster), Cluster = cluster)
+
+filtered_LTC_adjuvant <- LTC_adjuvant[LTC_adjuvant$Participant.ID %in% clusters_df$Participant.ID, ]
+
+selected_columns <- filtered_LTC_adjuvant[, c("Participant.ID", colnames(LTC_adjuvant)[14:19])]
+
+merged_df_elastic_adjuvant <- merge(clusters_df, selected_columns, by = "Participant.ID")
+
+metadata_adjuvant_filtered$Participant.ID <- rownames(metadata_adjuvant_filtered)
+merged_with_metadata <- merge(merged_df_elastic_adjuvant,
+                              metadata_adjuvant_filtered,
+                              by = "Participant.ID")
+
+annets <- read.csv(file.path(DKTK_DATA, "tp53_status_dktk_adjuvant.csv"))
+merged_with_metadata <- merge(merged_with_metadata,
+                              annets[, c("Participant.ID", "TP53.status", "TP53.variant")],
+                              by = "Participant.ID", all.x = TRUE)
+
+merged_with_metadata <- merged_with_metadata %>%
+  mutate(TP53_variant_group = case_when(
+    is.na(TP53.variant) ~ NA_character_,
+    TP53.variant == "wt" ~ "WT",
+    grepl("fs$|\\*$", TP53.variant) ~ "Frameshift/Nonsense Mutation",
+    TRUE ~ "Missense Mutation"
+  ))
+
+merged_with_metadata <- merged_with_metadata %>%
+  mutate(`TP53 mutation status` = case_when(
+    is.na(TP53_variant_group) ~ NA_character_,
+    TP53_variant_group == "Missense Mutation" ~ "Altered",
+    TRUE ~ "WT/Frameshift/Nonsense"
+  ))
+
+merged_with_metadata$`TP53 mutation status` <- factor(merged_with_metadata$`TP53 mutation status`,
+                                                         levels = c("WT/Frameshift/Nonsense", "Altered"))
+
+merged_with_metadata <- merged_with_metadata %>%
+  mutate(across(c(P16, `HPV16 DNA`, `HPV16 RNA`), ~ ifelse(. == "Positive", "Positive", "Negative")))
+
+merged_with_metadata <- merged_with_metadata %>%
+  mutate(
+    P16_Positive               = ifelse(P16 == "Positive", "Positive", "Negative"),
+    HPV16DNA_Positive          = ifelse(`HPV16 DNA` == "Positive", "Positive", "Negative"),
+    HPV16RNA_Positive          = ifelse(`HPV16 RNA` == "Positive", "Positive", "Negative"),
+    Double_P16_HPV16DNA        = ifelse(P16 == "Positive" & `HPV16 DNA` == "Positive", "Positive", "Negative"),
+    Double_P16_HPV16RNA        = ifelse(P16 == "Positive" & `HPV16 RNA` == "Positive", "Positive", "Negative"),
+    Double_HPV16DNA_HPV16RNA   = ifelse(`HPV16 DNA` == "Positive" & `HPV16 RNA` == "Positive", "Positive", "Negative"),
+    Triple_Positive            = ifelse(P16 == "Positive" & `HPV16 DNA` == "Positive" & `HPV16 RNA` == "Positive", "Positive", "Negative"),
+    Any_Positive               = ifelse(P16 == "Positive" | `HPV16 DNA` == "Positive" | `HPV16 RNA` == "Positive", "Positive", "Negative")
+  )
+```
+
+# Overall survival by CT panel
+
+```{r}
+merged_with_metadata$Cluster.DEG.kmeans <- factor(merged_with_metadata$Cluster.DEG.kmeans,
+  levels = c("High CT Panel Expression",
+             "Intermediate CT Panel Expression",
+             "Low CT Panel Expression"))
+
+surv_obj <- Surv(time = merged_with_metadata$OStime, event = merged_with_metadata$OS)
+
+fit_ct <- survfit(surv_obj ~ Cluster.DEG.kmeans, data = merged_with_metadata)
+plot_ct <- ggsurvplot(fit_ct, data = merged_with_metadata,
+                      pval = TRUE,
+                      risk.table = TRUE,
+                      conf.int = TRUE,
+                      palette = c("#7AB2D3", "#E7B800", "#DE3163"),
+                      xlab = "Time (months)",
+                      ylab = "Survival Probability",
+                      legend.title = "CT Gene Expression (All Patients)",
+                      legend.labs = c("High CT Panel Expression",
+                                      "Intermediate CT Panel Expression",
+                                      "Low CT Panel Expression"))
+print(plot_ct)
+```
+
+# Overall survival by HPV detection methods
+
+```{r}
+run_subgroup_survival <- function(data, indicator_col, label) {
+  subset_data <- data[data[[indicator_col]] == "Positive", ]
+  cat("Running subgroup survival for", label, "- n =", nrow(subset_data), "\n")
+  
+  if(nrow(subset_data) < 5) {
+    message("Too few samples in ", label, " subgroup.")
+    return(NULL)
+  }
+  
+  fit_sub <- survfit(Surv(OStime, OS) ~ Cluster.DEG.kmeans, data = subset_data)
+  
+  plot_sub <- ggsurvplot(fit_sub, data = subset_data,
+                         pval = TRUE,
+                         risk.table = TRUE,
+                         conf.int = TRUE,
+                         palette = c("#7AB2D3", "#E7B800", "#DE3163"),
+                         xlab = "Time (months)",
+                         ylab = "Survival Probability",
+                         legend.title = paste(label, "Detection"),
+                         legend.labs = c("High CT Panel Expression",
+                                         "Intermediate CT Panel Expression",
+                                         "Low CT Panel Expression"))
+  return(plot_sub)
+}
+
+plot_p16            <- run_subgroup_survival(merged_with_metadata, "P16_Positive", "P16")
+plot_dna            <- run_subgroup_survival(merged_with_metadata, "HPV16DNA_Positive", "HPV16 DNA")
+plot_rna            <- run_subgroup_survival(merged_with_metadata, "HPV16RNA_Positive", "HPV16 RNA")
+plot_double_p16_dna <- run_subgroup_survival(merged_with_metadata, "Double_P16_HPV16DNA", "Double (P16+HPV16 DNA)")
+plot_double_p16_rna <- run_subgroup_survival(merged_with_metadata, "Double_P16_HPV16RNA", "Double (P16+HPV16 RNA)")
+plot_double_dna_rna <- run_subgroup_survival(merged_with_metadata, "Double_HPV16DNA_HPV16RNA", "Double (HPV16 DNA+HPV16 RNA)")
+plot_triple         <- run_subgroup_survival(merged_with_metadata, "Triple_Positive", "Triple Positive")
+plot_any            <- run_subgroup_survival(merged_with_metadata, "Any_Positive", "Any Positive (P16/HPV16 DNA/HPV16 RNA)")
+
+plot_list <- list(
+  "P16" = plot_p16,
+  "HPV16 DNA" = plot_dna,
+  "HPV16 RNA" = plot_rna,
+  "Double (P16+HPV16 DNA)" = plot_double_p16_dna,
+  "Double (P16+HPV16 RNA)" = plot_double_p16_rna,
+  "Double (HPV16 DNA+HPV16 RNA)" = plot_double_dna_rna,
+  "Triple Positive" = plot_triple,
+  "Any Positive (P16/HPV16 DNA/HPV16 RNA)" = plot_any
+)
+
+for(name in names(plot_list)) {
+  cat("Plot for", name, "\n")
+  if(!is.null(plot_list[[name]])) {
+    print(plot_list[[name]])
+  }
+}
+```
+
+# Distant metastasis survival for Any_Positive
+
+```{r}
+any_positive_df <- merged_with_metadata %>%
+  filter(Any_Positive == "Positive")
+
+surv_object_dm <- Surv(time = any_positive_df$DMtime, 
+                       event = any_positive_df$DM)
+
+fit_dm <- survfit(surv_object_dm ~ Cluster.DEG.kmeans, data = any_positive_df)
+
+DM_any <- ggsurvplot(fit_dm, data = any_positive_df, 
+           pval = TRUE,
+           risk.table = TRUE,
+           conf.int = FALSE,
+           palette = c("#7AB2D3", "#E7B800", "#DE3163"),
+           xlab = "Time (months)",
+           ylab = "DM Survival Probability",
+           legend.labs = c("High CT Panel Expression", "Intermediate CT Panel Expression", "Low CT Panel Expression"))
+
+print(DM_any)
+```
+
+# Local regional control survival for Any_Positive
+
+```{r}
+cat("=== LRC Survival Analysis for Any_Positive Cohort ===\n\n")
+
+any_positive_data <- merged_with_metadata %>%
+  filter(Any_Positive == "Positive")
+
+cat("Any_Positive cohort size:", nrow(any_positive_data), "\n")
+cat("Patients with LRC event:", sum(any_positive_data$LRC == 1, na.rm = TRUE), "\n\n")
+
+any_positive_data$Cluster.DEG.kmeans <- factor(any_positive_data$Cluster.DEG.kmeans,
+  levels = c("High CT Panel Expression",
+             "Intermediate CT Panel Expression",
+             "Low CT Panel Expression"))
+
+surv_obj_lrc <- Surv(time = any_positive_data$LRCtime, event = any_positive_data$LRC)
+
+fit_lrc <- survfit(surv_obj_lrc ~ Cluster.DEG.kmeans, data = any_positive_data)
+
+plot_lrc_any <- ggsurvplot(fit_lrc, data = any_positive_data,
+                           pval = TRUE,
+                           risk.table = TRUE,
+                           conf.int = F,
+                           palette = c("#7AB2D3", "#E7B800", "#DE3163"),
+                           xlab = "Time (months)",
+                           ylab = "LRC Probability",
+                           legend.title = "(Any_Positive)",
+                           legend.labs = c("High CT Panel Expression",
+                                           "Intermediate CT Panel Expression",
+                                           "Low CT Panel Expression"))
+
+print(plot_lrc_any)
+```
+
+# Risk Tables: 4 Survival Analyses Combined
+
+```{r}
+# Create 4 risk tables for: (1) Any Positive OS, (2) P16 OS, (3) Any Positive DM, (4) Any Positive LRC
+
+# Prepare data for risk tables
+any_positive_surv <- merged_with_metadata %>%
+  filter(Any_Positive == "Positive")
+
+p16_surv <- merged_with_metadata %>%
+  filter(P16_Positive == "Positive")
+
+# Extract survival fits
+fit_any_os <- survfit(Surv(OStime, OS) ~ Cluster.DEG.kmeans, data = any_positive_surv)
+fit_p16_os <- survfit(Surv(OStime, OS) ~ Cluster.DEG.kmeans, data = p16_surv)
+
+# Create full plots with risk tables
+risk_table_1 <- ggsurvplot(fit_any_os, 
+                            data = any_positive_surv,
+                            pval = TRUE,
+                            risk.table = TRUE,
+                            risk.table.height = 0.3,
+                            palette = c("#7AB2D3", "#E7B800", "#DE3163"),
+                            title = "1. Overall Survival - Any Positive Cohort",
+                            xlab = "Time (months)",
+                            ylab = "Survival Probability",
+                            legend.labs = c("High CT Panel Expression", "Intermediate CT Panel Expression", "Low CT Panel Expression"))
+
+risk_table_2 <- ggsurvplot(fit_p16_os,
+                            data = p16_surv,
+                            pval = TRUE,
+                            risk.table = TRUE,
+                            risk.table.height = 0.3,
+                            palette = c("#7AB2D3", "#E7B800", "#DE3163"),
+                            title = "2. Overall Survival - P16 Positive Cohort",
+                            xlab = "Time (months)",
+                            ylab = "Survival Probability",
+                            legend.labs = c("High CT Panel Expression", "Intermediate CT Panel Expression", "Low CT Panel Expression"))
+
+risk_table_3 <- ggsurvplot(fit_dm,
+                            data = any_positive_df,
+                            pval = TRUE,
+                            risk.table = TRUE,
+                            risk.table.height = 0.3,
+                            palette = c("#7AB2D3", "#E7B800", "#DE3163"),
+                            title = "3. Distant Metastasis - Any Positive Cohort",
+                            xlab = "Time (months)",
+                            ylab = "DM-free Probability",
+                            legend.labs = c("High CT Panel Expression", "Intermediate CT Panel Expression", "Low CT Panel Expression"))
+
+risk_table_4 <- ggsurvplot(fit_lrc,
+                            data = any_positive_data,
+                            pval = TRUE,
+                            risk.table = TRUE,
+                            risk.table.height = 0.3,
+                            palette = c("#7AB2D3", "#E7B800", "#DE3163"),
+                            title = "4. Local Regional Control - Any Positive Cohort",
+                            xlab = "Time (months)",
+                            ylab = "LRC Probability",
+                            legend.labs = c("High CT Panel Expression", "Intermediate CT Panel Expression", "Low CT Panel Expression"))
+
+# Print all 4 plots with risk tables
+print(risk_table_1)
+print(risk_table_2)
+print(risk_table_3)
+print(risk_table_4)
+```
+
+# Risk Tables Only - PDF Output
+
+```{r}
+# Combine all 4 risk tables into one row on a single page
+pdf(file.path(DKTK_OUT, "Risk_Tables_4_Analyses.pdf"), width = 24, height = 3)
+
+gridExtra::grid.arrange(
+  risk_table_1$table,
+  risk_table_2$table,
+  risk_table_3$table,
+  risk_table_4$table,
+  ncol = 4,
+  nrow = 1
+)
+
+dev.off()
+
+cat("\n✓ Risk tables (4 in 1 row) saved to 'Risk_Tables_4_Analyses.pdf'\n")
+```
+
+
+# Overall Survival: CT genes + TP53 Mutation
+
+```{r}
+# Any Positive cohort: OS + TP53 Mutation
+survival_os_tp53 <- merged_with_metadata %>%
+  filter(Any_Positive == "Positive",
+         !is.na(OStime), !is.na(OS), 
+         !is.na(Cluster.DEG.kmeans), !is.na(TP53_variant_group)) %>%
+  mutate(
+    TP53_status = ifelse(str_detect(TP53_variant_group, "WT"), "WT", "Mutant"),
+    TP53_status = factor(TP53_status, levels = c("WT", "Mutant")),
+    Combined = paste(Cluster.DEG.kmeans, TP53_status, sep = " + "),
+    Combined = factor(Combined, levels = c("High CT Panel Expression + WT", "High CT Panel Expression + Mutant",
+                                            "Intermediate CT Panel Expression + WT", "Intermediate CT Panel Expression + Mutant",
+                                            "Low CT Panel Expression + WT", "Low CT Panel Expression + Mutant")),
+    Combined = forcats::fct_drop(Combined)
+  )
+
+surv_os_tp53 <- Surv(time = survival_os_tp53$OStime, event = survival_os_tp53$OS)
+
+# Three models
+fit_os_tp53_ct <- survfit(surv_os_tp53 ~ Cluster.DEG.kmeans, data = survival_os_tp53)
+fit_os_tp53_tp53 <- survfit(surv_os_tp53 ~ TP53_status, data = survival_os_tp53)
+fit_os_tp53_combined <- survfit(surv_os_tp53 ~ Combined, data = survival_os_tp53)
+
+# P-values
+p_os_tp53_ct <- 1 - pchisq(survdiff(surv_os_tp53 ~ Cluster.DEG.kmeans, data = survival_os_tp53)$chisq, 2)
+p_os_tp53_tp53 <- 1 - pchisq(survdiff(surv_os_tp53 ~ TP53_status, data = survival_os_tp53)$chisq, 1)
+p_os_tp53_combined <- 1 - pchisq(survdiff(surv_os_tp53 ~ Combined, data = survival_os_tp53)$chisq, 5)
+
+cat("OS + TP53 Mutation (n=", nrow(survival_os_tp53), ", events=", sum(survival_os_tp53$OS), ")\n")
+cat("CT Panel alone:", format(p_os_tp53_ct, digits=4), "\n")
+cat("TP53 alone:", format(p_os_tp53_tp53, digits=4), "\n")
+cat("Combined:", format(p_os_tp53_combined, digits=4), "\n\n")
+
+# Plots
+ct_cols <- c("#7AB2D3", "#E7B800", "#DE3163")
+tp53_cols <- c("#2E7D9A", "#E74C3C")
+
+p1 <- ggsurvplot(fit_os_tp53_ct, data = survival_os_tp53, pval = T, risk.table = T, 
+                 palette = ct_cols, title = "Model 1: CT genes", ylab = "OS Probability")$plot
+p2 <- ggsurvplot(fit_os_tp53_tp53, data = survival_os_tp53, pval = T, risk.table = T, 
+                 palette = tp53_cols, title = "Model 2: TP53", ylab = "OS Probability")$plot
+p3 <- ggsurvplot(fit_os_tp53_combined, data = survival_os_tp53, pval = T, risk.table = T,
+                 palette = c("#5A8BB5", "#B8D9E8", "#D4A000", "#F5E6B3", "#B21D49", "#F5D5E0"),
+                 title = "Model 3: Combined", ylab = "OS Probability")$plot
+
+pdf(file.path(DKTK_OUT, "OS_TP53Mutation.pdf"), width = 14, height = 8)
+print(p1)
+print(p2)
+print(p3)
+dev.off()
+```
+
+# Overall Survival: CT genes + P53 Staining
+
+```{r}
+# Any Positive cohort: OS + P53 Staining
+survival_os_p53 <- merged_with_metadata %>%
+  filter(Any_Positive == "Positive",
+         !is.na(OStime), !is.na(OS), 
+         !is.na(Cluster.DEG.kmeans), !is.na(P53)) %>%
+  mutate(
+    P53_status = ifelse(P53 == "Positive", "P53+", "P53-"),
+    Cluster.DEG.kmeans = str_trim(Cluster.DEG.kmeans),
+    Combined = paste(Cluster.DEG.kmeans, P53_status, sep = " + "),
+    Combined = factor(Combined, levels = c("High CT Panel Expression + P53+", "High CT Panel Expression + P53-", 
+                                            "Intermediate CT Panel Expression + P53+", "Intermediate CT Panel Expression + P53-",
+                                            "Low CT Panel Expression + P53+", "Low CT Panel Expression + P53-")),
+    Combined = forcats::fct_drop(Combined)
+  )
+
+surv_os_p53 <- Surv(time = survival_os_p53$OStime, event = survival_os_p53$OS)
+
+# Three models
+fit_os_p53_ct <- survfit(surv_os_p53 ~ Cluster.DEG.kmeans, data = survival_os_p53)
+fit_os_p53_p53 <- survfit(surv_os_p53 ~ P53_status, data = survival_os_p53)
+fit_os_p53_combined <- survfit(surv_os_p53 ~ Combined, data = survival_os_p53)
+
+# P-values
+p_os_p53_ct <- 1 - pchisq(survdiff(surv_os_p53 ~ Cluster.DEG.kmeans, data = survival_os_p53)$chisq, 2)
+p_os_p53_p53 <- 1 - pchisq(survdiff(surv_os_p53 ~ P53_status, data = survival_os_p53)$chisq, 1)
+p_os_p53_combined <- 1 - pchisq(survdiff(surv_os_p53 ~ Combined, data = survival_os_p53)$chisq, 5)
+
+cat("OS + P53 Staining (n=", nrow(survival_os_p53), ", events=", sum(survival_os_p53$OS), ")\n")
+cat("CT Panel alone:", format(p_os_p53_ct, digits=4), "\n")
+cat("P53 Staining alone:", format(p_os_p53_p53, digits=4), "\n")
+cat("Combined:", format(p_os_p53_combined, digits=4), "\n\n")
+
+# Color palettes
+ct_cols <- c("#7AB2D3", "#E7B800", "#DE3163")
+
+p1 <- ggsurvplot(fit_os_p53_ct, data = survival_os_p53, pval = T, risk.table = T, 
+                 palette = ct_cols, title = "Model 1: CT genes", ylab = "OS Probability")$plot +
+  guides(color = guide_legend(nrow = 2))
+p2 <- ggsurvplot(fit_os_p53_p53, data = survival_os_p53, pval = T, risk.table = T, 
+                 palette = c("#4A90E2", "#E94B3C"), title = "Model 2: P53 Staining", ylab = "OS Probability")$plot +
+  guides(color = guide_legend(nrow = 2))
+
+# Combined: use colors mapped by sorted factor order
+p3 <- ggsurvplot(fit_os_p53_combined, data = survival_os_p53, pval = T, risk.table = T,
+                 palette = c("#B8D9E8", "#E7B800", "#F5E6B3", "#DE3163", "#F5D5E0"),
+                 title = "Model 3: Combined", ylab = "OS Probability")$plot +
+  guides(color = guide_legend(nrow = 2))
+
+pdf(file.path(DKTK_OUT, "OS_P53Staining.pdf"), width = 14, height = 8)
+print(p1)
+print(p2)
+print(p3)
+dev.off()
+```
+
+# Distant Metastasis: CT genes + TP53 Mutation
+
+```{r}
+# Any Positive cohort: DM + TP53 Mutation
+survival_dm_tp53 <- merged_with_metadata %>%
+  filter(Any_Positive == "Positive",
+         !is.na(DMtime), !is.na(DM), 
+         !is.na(Cluster.DEG.kmeans), !is.na(TP53_variant_group)) %>%
+  mutate(
+    TP53_status = ifelse(str_detect(TP53_variant_group, "WT"), "WT", "Mutant"),
+    TP53_status = factor(TP53_status, levels = c("WT", "Mutant")),
+    Combined = paste(Cluster.DEG.kmeans, TP53_status, sep = " + "),
+    Combined = factor(Combined, levels = c("High CT Panel Expression + WT", "High CT Panel Expression + Mutant", "Intermediate CT Panel Expression + WT", "Intermediate CT Panel Expression + Mutant", "Low CT Panel Expression + WT", "Low CT Panel Expression + Mutant")),
+    Combined = forcats::fct_drop(Combined)
+  )
+
+surv_dm_tp53 <- Surv(time = survival_dm_tp53$DMtime, event = survival_dm_tp53$DM)
+
+# Three models
+fit_dm_tp53_ct <- survfit(surv_dm_tp53 ~ Cluster.DEG.kmeans, data = survival_dm_tp53)
+fit_dm_tp53_tp53 <- survfit(surv_dm_tp53 ~ TP53_status, data = survival_dm_tp53)
+fit_dm_tp53_combined <- survfit(surv_dm_tp53 ~ Combined, data = survival_dm_tp53)
+
+# P-values
+p_dm_tp53_ct <- 1 - pchisq(survdiff(surv_dm_tp53 ~ Cluster.DEG.kmeans, data = survival_dm_tp53)$chisq, 2)
+p_dm_tp53_tp53 <- 1 - pchisq(survdiff(surv_dm_tp53 ~ TP53_status, data = survival_dm_tp53)$chisq, 1)
+p_dm_tp53_combined <- 1 - pchisq(survdiff(surv_dm_tp53 ~ Combined, data = survival_dm_tp53)$chisq, 5)
+
+cat("DM + TP53 Mutation (n=", nrow(survival_dm_tp53), ", events=", sum(survival_dm_tp53$DM), ")\n")
+cat("CT Panel alone:", format(p_dm_tp53_ct, digits=4), "\n")
+cat("TP53 alone:", format(p_dm_tp53_tp53, digits=4), "\n")
+cat("Combined:", format(p_dm_tp53_combined, digits=4), "\n\n")
+
+# Color palettes
+ct_cols <- c("#7AB2D3", "#E7B800", "#DE3163")
+tp53_cols <- c("#2E7D9A", "#E74C3C")
+
+p1 <- ggsurvplot(fit_dm_tp53_ct, data = survival_dm_tp53, pval = T, risk.table = T, 
+                 palette = ct_cols, title = "Model 1: CT genes", ylab = "DM-free Probability",
+                 legend.labs = c("High CT Panel Expression", "Intermediate CT Panel Expression", "Low CT Panel Expression"))$plot
+p2 <- ggsurvplot(fit_dm_tp53_tp53, data = survival_dm_tp53, pval = T, risk.table = T, 
+                 palette = tp53_cols, title = "Model 2: TP53", ylab = "DM-free Probability",
+                 legend.labs = c("WT", "Mutant"))$plot
+p3 <- ggsurvplot(fit_dm_tp53_combined, data = survival_dm_tp53, pval = T, risk.table = T,
+                 palette = c("#5A8BB5", "#B8D9E8", "#D4A000", "#F5E6B3", "#B21D49", "#F5D5E0"),
+                 title = "Model 3: Combined", ylab = "DM-free Probability",
+                 legend.labs = c("High + WT", "High + Mutant", "Intermediate + WT", "Intermediate + Mutant", "Low + WT", "Low + Mutant"))$plot
+
+pdf(file.path(DKTK_OUT, "DM_TP53Mutation.pdf"), width = 14, height = 8)
+print(p1)
+print(p2)
+print(p3)
+dev.off()
+```
+
+# Distant Metastasis: CT genes + P53 Staining
+
+```{r}
+# Any Positive cohort: DM + P53 Staining
+survival_dm_p53 <- merged_with_metadata %>%
+  filter(Any_Positive == "Positive",
+         !is.na(DMtime), !is.na(DM), 
+         !is.na(Cluster.DEG.kmeans), !is.na(P53)) %>%
+  mutate(
+    P53_status = ifelse(P53 == "Positive", "P53+", "P53-"),
+    Cluster.DEG.kmeans = str_trim(Cluster.DEG.kmeans),
+    Combined = paste(Cluster.DEG.kmeans, P53_status, sep = " + "),
+    Combined = factor(Combined, levels = c("High CT Panel Expression + P53+", "High CT Panel Expression + P53-", 
+                                            "Intermediate CT Panel Expression + P53+", "Intermediate CT Panel Expression + P53-",
+                                            "Low CT Panel Expression + P53+", "Low CT Panel Expression + P53-")),
+    Combined = forcats::fct_drop(Combined)
+  )
+
+surv_dm_p53 <- Surv(time = survival_dm_p53$DMtime, event = survival_dm_p53$DM)
+
+# Three models
+fit_dm_p53_ct <- survfit(surv_dm_p53 ~ Cluster.DEG.kmeans, data = survival_dm_p53)
+fit_dm_p53_p53 <- survfit(surv_dm_p53 ~ P53_status, data = survival_dm_p53)
+fit_dm_p53_combined <- survfit(surv_dm_p53 ~ Combined, data = survival_dm_p53)
+
+# P-values
+p_dm_p53_ct <- 1 - pchisq(survdiff(surv_dm_p53 ~ Cluster.DEG.kmeans, data = survival_dm_p53)$chisq, 2)
+p_dm_p53_p53 <- 1 - pchisq(survdiff(surv_dm_p53 ~ P53_status, data = survival_dm_p53)$chisq, 1)
+p_dm_p53_combined <- 1 - pchisq(survdiff(surv_dm_p53 ~ Combined, data = survival_dm_p53)$chisq, 5)
+
+cat("DM + P53 Staining (n=", nrow(survival_dm_p53), ", events=", sum(survival_dm_p53$DM), ")\n")
+cat("CT Panel alone:", format(p_dm_p53_ct, digits=4), "\n")
+cat("P53 Staining alone:", format(p_dm_p53_p53, digits=4), "\n")
+cat("Combined:", format(p_dm_p53_combined, digits=4), "\n\n")
+
+# Color palettes
+ct_cols <- c("#7AB2D3", "#E7B800", "#DE3163")
+
+p1 <- ggsurvplot(fit_dm_p53_ct, data = survival_dm_p53, pval = T, risk.table = T, 
+                 palette = ct_cols, title = "Model 1: CT genes", ylab = "DM-free Probability",
+                 legend.labs = c("High CT Panel Expression", "Intermediate CT Panel Expression", "Low CT Panel Expression"))$plot +
+  guides(color = guide_legend(nrow = 2))
+p2 <- ggsurvplot(fit_dm_p53_p53, data = survival_dm_p53, pval = T, risk.table = T, 
+                 palette = c("#4A90E2", "#E94B3C"), title = "Model 2: P53 Staining", ylab = "DM-free Probability",
+                 legend.labs = c("P53-", "P53+"))$plot +
+  guides(color = guide_legend(nrow = 2))
+
+# Combined: use colors mapped by sorted factor order
+p3 <- ggsurvplot(fit_dm_p53_combined, data = survival_dm_p53, pval = T, risk.table = T,
+                 palette = c("#B8D9E8", "#E7B800", "#F5E6B3", "#DE3163", "#F5D5E0"),
+                 title = "Model 3: Combined", ylab = "DM-free Probability",
+                 legend.labs = c("High + P53-", "Intermediate + P53+", "Intermediate + P53-", "Low + P53+", "Low + P53-"))$plot +
+  guides(color = guide_legend(nrow = 2))
+
+pdf(file.path(DKTK_OUT, "DM_P53Staining.pdf"), width = 14, height = 8)
+print(p1)
+print(p2)
+print(p3)
+dev.off()
+```
+
+# Summary: All Analyses
+
+```{r}
+# Summary table
+summary_results <- data.frame(
+  Analysis = c("OS + TP53", "OS + P53 Staining", "DM + TP53", "DM + P53 Staining"),
+  N = c(nrow(survival_os_tp53), nrow(survival_os_p53), nrow(survival_dm_tp53), nrow(survival_dm_p53)),
+  Events = c(sum(survival_os_tp53$OS), sum(survival_os_p53$OS), sum(survival_dm_tp53$DM), sum(survival_dm_p53$DM)),
+  CT_p = c(p_os_tp53_ct, p_os_p53_ct, p_dm_tp53_ct, p_dm_p53_ct),
+  TP53_p = c(p_os_tp53_tp53, p_os_p53_p53, p_dm_tp53_tp53, p_dm_p53_p53),
+  Combined_p = c(p_os_tp53_combined, p_os_p53_combined, p_dm_tp53_combined, p_dm_p53_combined)
+)
+
+cat("\n=== SUMMARY TABLE ===\n")
+print(summary_results)
+
+# Save summary
+#write.csv(summary_results, "survival_analysis_summary.csv", row.names = FALSE)
+cat("\n✓ Summary saved to survival_analysis_summary.csv\n")
+```
+
+# Cox Proportional Hazards: Model Comparison (C-index)
+
+```{r}
+# ===== OS + TP53 Mutation =====
+cat("\n=== OS + TP53 Mutation: Cox Model Comparison ===\n\n")
+
+# Model 1: CT panel alone
+cox_os_tp53_ct <- coxph(surv_os_tp53 ~ Cluster.DEG.kmeans, data = survival_os_tp53)
+
+# Model 2: TP53 alone
+cox_os_tp53_tp53 <- coxph(surv_os_tp53 ~ TP53_status, data = survival_os_tp53)
+
+# Model 3: CT panel + TP53
+cox_os_tp53_combined <- coxph(surv_os_tp53 ~ Cluster.DEG.kmeans + TP53_status, data = survival_os_tp53)
+
+# Calculate C-indices
+c_os_tp53_ct <- concordance(cox_os_tp53_ct)$concordance
+c_os_tp53_tp53 <- concordance(cox_os_tp53_tp53)$concordance
+c_os_tp53_combined <- concordance(cox_os_tp53_combined)$concordance
+
+# LRT for added value
+lrt_os_tp53 <- anova(cox_os_tp53_tp53, cox_os_tp53_combined, test = "LRT")
+
+os_tp53_comparison <- data.frame(
+  Model = c("CT Panel", "TP53 Mutation", "CT Panel + TP53"),
+  C_Index = round(c(c_os_tp53_ct, c_os_tp53_tp53, c_os_tp53_combined), 3),
+  LRT_p = c(NA, NA, round(lrt_os_tp53$`Pr(>|Chi|)`[2], 4))
+)
+
+cat("OS + TP53 Mutation Model Comparison:\n")
+print(os_tp53_comparison)
+
+# ===== OS + P53 Staining =====
+cat("\n=== OS + P53 Staining: Cox Model Comparison ===\n\n")
+
+cox_os_p53_ct <- coxph(surv_os_p53 ~ Cluster.DEG.kmeans, data = survival_os_p53)
+cox_os_p53_p53 <- coxph(surv_os_p53 ~ P53_status, data = survival_os_p53)
+cox_os_p53_combined <- coxph(surv_os_p53 ~ Cluster.DEG.kmeans + P53_status, data = survival_os_p53)
+
+c_os_p53_ct <- concordance(cox_os_p53_ct)$concordance
+c_os_p53_p53 <- concordance(cox_os_p53_p53)$concordance
+c_os_p53_combined <- concordance(cox_os_p53_combined)$concordance
+
+lrt_os_p53 <- anova(cox_os_p53_p53, cox_os_p53_combined, test = "LRT")
+
+os_p53_comparison <- data.frame(
+  Model = c("CT Panel", "P53 Staining", "CT Panel + P53"),
+  C_Index = round(c(c_os_p53_ct, c_os_p53_p53, c_os_p53_combined), 3),
+  LRT_p = c(NA, NA, round(lrt_os_p53$`Pr(>|Chi|)`[2], 4))
+)
+
+cat("OS + P53 Staining Model Comparison:\n")
+print(os_p53_comparison)
+
+# ===== DM + TP53 Mutation =====
+cat("\n=== DM + TP53 Mutation: Cox Model Comparison ===\n\n")
+
+cox_dm_tp53_ct <- coxph(surv_dm_tp53 ~ Cluster.DEG.kmeans, data = survival_dm_tp53)
+cox_dm_tp53_tp53 <- coxph(surv_dm_tp53 ~ TP53_status, data = survival_dm_tp53)
+cox_dm_tp53_combined <- coxph(surv_dm_tp53 ~ Cluster.DEG.kmeans + TP53_status, data = survival_dm_tp53)
+
+c_dm_tp53_ct <- concordance(cox_dm_tp53_ct)$concordance
+c_dm_tp53_tp53 <- concordance(cox_dm_tp53_tp53)$concordance
+c_dm_tp53_combined <- concordance(cox_dm_tp53_combined)$concordance
+
+lrt_dm_tp53 <- anova(cox_dm_tp53_tp53, cox_dm_tp53_combined, test = "LRT")
+
+dm_tp53_comparison <- data.frame(
+  Model = c("CT Panel", "TP53 Mutation", "CT Panel + TP53"),
+  C_Index = round(c(c_dm_tp53_ct, c_dm_tp53_tp53, c_dm_tp53_combined), 3),
+  LRT_p = c(NA, NA, round(lrt_dm_tp53$`Pr(>|Chi|)`[2], 4))
+)
+
+cat("DM + TP53 Mutation Model Comparison:\n")
+print(dm_tp53_comparison)
+
+# ===== DM + P53 Staining =====
+cat("\n=== DM + P53 Staining: Cox Model Comparison ===\n\n")
+
+cox_dm_p53_ct <- coxph(surv_dm_p53 ~ Cluster.DEG.kmeans, data = survival_dm_p53)
+cox_dm_p53_p53 <- coxph(surv_dm_p53 ~ P53_status, data = survival_dm_p53)
+cox_dm_p53_combined <- coxph(surv_dm_p53 ~ Cluster.DEG.kmeans + P53_status, data = survival_dm_p53)
+
+c_dm_p53_ct <- concordance(cox_dm_p53_ct)$concordance
+c_dm_p53_p53 <- concordance(cox_dm_p53_p53)$concordance
+c_dm_p53_combined <- concordance(cox_dm_p53_combined)$concordance
+
+lrt_dm_p53 <- anova(cox_dm_p53_p53, cox_dm_p53_combined, test = "LRT")
+
+dm_p53_comparison <- data.frame(
+  Model = c("CT Panel", "P53 Staining", "CT Panel + P53"),
+  C_Index = round(c(c_dm_p53_ct, c_dm_p53_p53, c_dm_p53_combined), 3),
+  LRT_p = c(NA, NA, round(lrt_dm_p53$`Pr(>|Chi|)`[2], 4))
+)
+
+cat("DM + P53 Staining Model Comparison:\n")
+print(dm_p53_comparison)
+
+# Combine all comparisons
+all_model_comparisons <- bind_rows(
+  os_tp53_comparison %>% mutate(Analysis = "OS + TP53"),
+  os_p53_comparison %>% mutate(Analysis = "OS + P53"),
+  dm_tp53_comparison %>% mutate(Analysis = "DM + TP53"),
+  dm_p53_comparison %>% mutate(Analysis = "DM + P53")
+) %>%
+  select(Analysis, everything())
+
+cat("\n=== OVERALL MODEL COMPARISON ===\n")
+cat("Note: C-indices estimated on same dataset (apparent performance). LRT_p = p-value for added value test.\n\n")
+print(all_model_comparisons)
+
+# Format table for display
+all_model_comparisons_display <- all_model_comparisons %>%
+  mutate(
+    C_Index = round(C_Index, 3),
+    LRT_p = ifelse(is.na(LRT_p), "-", round(LRT_p, 4))
+  ) %>%
+  separate(Analysis, into = c("Endpoint", "Marker"), sep = " \\+ ", remove = FALSE) %>%
+  mutate(
+    N = case_when(
+      Endpoint == "OS" ~ 75,
+      Endpoint == "DM" ~ 75
+    )
+  ) %>%
+  select(Endpoint, Marker, N, Model, C_Index, LRT_p) %>%
+  rename(
+    "Endpoint" = "Endpoint",
+    "Marker" = "Marker",
+    "N" = "N",
+    "Model" = "Model",
+    "C-Index" = "C_Index",
+    "LRT p-value" = "LRT_p"
+  )
+
+knitr::kable(all_model_comparisons_display, 
+             caption = "Cox Model Comparison: Prognostic Discrimination (C-Index) for OS and DM Endpoints",
+             align = c("c", "l", "c", "l", "c", "c"))
+
+write.csv(all_model_comparisons, file.path(DKTK_OUT, "cox_model_comparison_cindex.csv"), row.names = FALSE)
+cat("\n✓ C-index comparison saved to cox_model_comparison_cindex.csv\n")
+```
+
+
+
+# FIGURE 1A: TP53 Mutation Only
+```{r}
+p1 <- ggsurvplot(fit_os_tp53_tp53, data = survival_os_tp53, 
+                 pval = TRUE, risk.table = TRUE,
+                 palette = c("#2E7D9A", "#E74C3C"),
+                 title = "A: TP53 Mutation Only",
+                 xlab = "Time (months)", ylab = "OS Probability",
+                 xlim = c(0, 100), ylim = c(0, 1),
+                 legend.labs = c("WT", "Mutant"),
+                 font.legend = 8,
+                 font.title = 11,
+                 font.x = 9,
+                 font.y = 9,
+                 risk.table.height = 0.3)
+
+
+
+pdf(file.path(DKTK_OUT, "Fig1A_TP53Mutation_OS.pdf"), width = 3, height = 6, onefile = FALSE)
+print(p1)
+dev.off()
+```
+
+# FIGURE 1B: CT Panel + TP53 Mutation
+```{r}
+p2 <- ggsurvplot(fit_os_tp53_combined, data = survival_os_tp53,
+                 pval = TRUE, risk.table = TRUE,
+                 palette = c("#5A8BB5", "#B8D9E8", "#D4A000", "#F5E6B3", "#B21D49", "#F5D5E0"),
+                 title = "B: CT Panel + TP53 Mutation",
+                 xlab = "Time (months)", ylab = "OS Probability",
+                 xlim = c(0, 100), ylim = c(0, 1),
+                 legend.labs = c("High + WT", "High + Mutant", "Intermediate + WT", "Intermediate + Mutant", "Low + WT", "Low + Mutant"),
+                 font.legend = 8,
+                 font.title = 11,
+                 font.x = 9,
+                 font.y = 9,
+                 risk.table.height = 0.3)
+#p2$plot <- p2$plot + guides(color = guide_legend(nrow = 2))
+
+
+pdf(file.path(DKTK_OUT, "Fig1B_CTPanelTP53_OS.pdf"), width = 6, height = 6, onefile = FALSE)
+print(p2)
+dev.off()
+cat("\n✓ Saved: Fig1B_CTPanelTP53_OS.pdf\n")
+```
+
+# FIGURE 2A: P53 Staining Only
+```{r}
+p3 <- ggsurvplot(fit_os_p53_p53, data = survival_os_p53,
+                 pval = TRUE, risk.table = TRUE,
+                 palette = c("#4A90E2", "#E94B3C"),
+                 title = "C: P53 Only",
+                 xlab = "Time (months)", ylab = "Overall Survival Probability",
+                 xlim = c(0, 100), ylim = c(0, 1),
+                 legend.labs = c("P53-", "P53+"),
+                 font.legend = 8,
+                 font.title = 11,
+                 font.x = 9,
+                 font.y = 9,
+                 risk.table.height = 0.3)
+
+
+pdf(file.path(DKTK_OUT, "Fig2A_P53Staining_OS.pdf"), width = 3, height = 6, onefile = FALSE)
+print(p3)
+dev.off()
+cat("\n✓ Saved: Fig2A_P53Staining_OS.pdf\n")
+```
+
+# FIGURE 2B: CT Panel + P53 Staining
+```{r}
+p4 <- ggsurvplot(fit_os_p53_combined, data = survival_os_p53,
+                 pval = TRUE, risk.table = TRUE,
+                 palette = c("#B8D9E8", "#E7B800", "#F5E6B3", "#DE3163", "#F5D5E0"),
+                 title = "D: CT Panel + P53",
+                 xlab = "Time (months)", ylab = "Overall Survival Probability",
+                 xlim = c(0, 100), ylim = c(0, 1),
+                 legend.labs = c("High + P53-", "Intermediate + P53+", "Intermediate + P53-", "Low + P53+", "Low + P53-"),
+                 font.legend = 8,
+                 font.title = 11,
+                 font.x = 9,
+                 font.y = 9,
+                 risk.table.height = 0.3)
+p4$plot <- p4$plot + guides(color = guide_legend(nrow = 2))
+
+
+pdf(file.path(DKTK_OUT, "Fig2B_CTPanelP53_OS.pdf"), width = 6, height = 6, onefile = FALSE)
+print(p4)
+dev.off()
+cat("\n✓ Saved: Fig2B_CTPanelP53_OS.pdf\n")
+```
+

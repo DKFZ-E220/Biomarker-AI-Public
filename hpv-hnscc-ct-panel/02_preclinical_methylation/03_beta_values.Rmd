@@ -1,0 +1,265 @@
+---
+title: "Beta values — extraction, variable CpG filtering, M-value conversion"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# Loads the preprocessed RnBeads object produced by 01_rnbeads_hpv.R,
+# then extracts beta values, converts to M values, and plots heatmaps
+# of the most variable CpG sites.
+source(here::here("config.R"))
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+```{r, results='hide'}
+library("BiocParallel")
+library("GenomicFeatures")
+library("RnBeads")
+library("ggplot2")
+library("reshape2")
+library("grid")
+library("gridExtra")
+library("GOstats")
+library("LOLA")
+library("qvalue")
+library('wordcloud')
+library("hexbin")
+library("RnBeads.hg38")
+library("dplyr")
+library(biomaRt)
+```
+
+
+```{r}
+load(file.path(PRECLIN_METH_OUT, "rnb.set.PC.rda"))
+rnb.options(identifiers.column="Sample")
+```
+
+
+```{r}
+Genes <- meth(rnb.set.PC, row.names = T, type="genes")
+Genes <- as.data.frame(Genes)
+Promoters <- meth(rnb.set.PC, row.names = T, type="promoters")
+Promoters <- as.data.frame(Promoters)
+cpg_beta <- meth(rnb.set.PC, row.names=T)
+#write.csv(cpg, "Beta_cpg_Untreated.csv", row.names=T)
+```
+
+
+#convert to gene symbols
+```{r}
+
+mart <- useMart(biomart = "ensembl", dataset = "hsapiens_gene_ensembl")
+
+getGeneSymbols <- function(ensembl_ids) {
+  gene_symbols <- getBM(
+    attributes = c('ensembl_gene_id', 'hgnc_symbol'), 
+    filters = 'ensembl_gene_id', 
+    values = ensembl_ids, 
+    mart = mart
+  )
+  return(gene_symbols)
+}
+
+```
+
+
+```{r}
+# Get the gene symbols or use Ensembl IDs if symbols are missing
+genes_symbols_df <- getGeneSymbols(row.names(Genes))
+# It's important to create a named vector to match by names not by position
+gene_symbol_or_ensembl <- setNames(genes_symbols_df$hgnc_symbol, genes_symbols_df$ensembl_gene_id)
+
+# Match and replace in Genes
+Genes$Gene_Symbol <- gene_symbol_or_ensembl[ row.names(Genes) ]
+Genes <- Genes %>%
+  dplyr::select(Gene_Symbol, everything())
+
+# Match and replace in Promoters
+promoters_symbols_df <- getGeneSymbols(row.names(Promoters))
+promoter_symbol_or_ensembl <- setNames(promoters_symbols_df$hgnc_symbol, promoters_symbols_df$ensembl_gene_id)
+
+Promoters$Gene_Symbol <- promoter_symbol_or_ensembl[ row.names(Promoters) ]
+Promoters <- Promoters %>%
+  dplyr::select(Gene_Symbol, everything())
+```
+
+#some ensemble ids dont ahve symbols, so keeping their id in the symbol column instead of blank for future use
+```{r}
+# For Genes
+Genes$Gene_Symbol <- ifelse(is.na(Genes$Gene_Symbol) | Genes$Gene_Symbol == "", row.names(Genes), Genes$Gene_Symbol)
+any(duplicated(Genes$Group.1))
+Genes = aggregate(Genes,FUN = mean,by=list(Genes$Gene_Symbol))
+any(duplicated(Genes$Group.1))
+Genes <- Genes[,-2]
+Genes <- Genes %>% 
+  dplyr::rename (Gene_Symbol=Group.1)
+# For Promoters
+Promoters$Gene_Symbol <- ifelse(is.na(Promoters$Gene_Symbol) | Promoters$Gene_Symbol == "", row.names(Promoters), Promoters$Gene_Symbol)
+any(duplicated(Promoters$Gene_Symbol))
+Promoters = aggregate(Promoters,FUN = mean,by=list(Promoters$Gene_Symbol))
+any(duplicated(Promoters$Group.1))
+Promoters <- Promoters[,-2]
+Promoters <- Promoters %>% 
+  dplyr::rename (Gene_Symbol=Group.1)
+
+#write.csv(Genes, "Beta_gene_all_with_Symbols.csv", row.names = TRUE)
+#write.csv(Promoters, "Beta_promoters_all_with_Symbols.csv", row.names = TRUE)
+
+```
+
+
+
+#separate files based on HPV status
+```{r}
+Genes_untreated <- Genes [,c(1:19)]
+Genes_untreated_HPVneg <- Genes [,c(1:10)]
+Genes_untreated_HPVpos <- Genes [, c(1,11:19)]
+
+Promoters_untreated <- Promoters [,c(1:19)]
+Promoters_untreated_HPVneg <- Promoters [,c(1:10)]
+Promoters_untreated_HPVpos <- Promoters [, c(1,11:19)]
+
+#write.csv(Genes_untreated, "Beta_gene_untreated_with_Symbols.csv", row.names = TRUE)
+#write.csv(Genes_untreated_HPVneg, "Beta_gene_untreated_HPVneg_with_Symbols.csv", row.names = TRUE)
+#write.csv(Genes_untreated_HPVpos, "Beta_gene_untreated_HPVpos_with_Symbols.csv", row.names = TRUE)
+
+#write.csv(Promoters_untreated, "Beta_promoters_untreated_with_Symbols.csv", row.names = TRUE)
+#write.csv(Promoters_untreated_HPVneg, "Beta_promoters_untreated_HPVneg_with_Symbols.csv", row.names = TRUE)
+#write.csv(Promoters_untreated_HPVpos, "Beta_promoters_untreated_HPVpos_with_Symbols.csv", row.names = TRUE)
+
+```
+
+
+```{r}
+cpg_beta <- as.data.frame(cpg_beta)
+# Convert rownames to a column
+cpg_beta <- cpg_beta %>% 
+  tibble::rownames_to_column("row_id")
+
+# Arrange (sort) by the new row_id column
+cpg_beta_ordered <- cpg_beta %>% 
+  arrange(row_id)
+rownames(cpg_beta_ordered) <- cpg_beta_ordered[,1]  
+cpg_beta_ordered <- cpg_beta_ordered[,-1]          
+
+
+```
+
+###Teresa code
+
+#' Get x most variable CpGs based on a beta matrix.
+#'
+#' @param input_beta_matrix A matrix of beta values.
+#' @param x Number of most variable CpGs to return
+#'
+#'
+get_most_variable <- function(input_beta_matrix, x) {
+  filtered_beta_matrix <- input_beta_matrix[names(head(sort(apply(X=input_beta_matrix, MARGIN=1, FUN=sd), decreasing=TRUE), x)), ]
+  return(filtered_beta_matrix)
+}
+
+# Calculate the number of CpG islands that constitute the top 1%
+top_1_percent_count <- ceiling(nrow(cpg_beta) * 0.01)
+
+# Apply the get_most_variable function to select the top 1% most variable CpG islands
+top_1_percent_variable_cpg <- get_most_variable(input_beta_matrix = cpg_beta, x = top_1_percent_count)
+
+```{r}
+#' Get x percent most variable CpGs based on a beta matrix.
+#'
+#' @param input_beta_matrix A dataframe of beta values.
+#' @param x Percentage of most variable CpGs to return.
+#'
+get_most_variable <- function(input_beta_matrix, x) {
+  # Ensure the input is treated as a dataframe
+  if (is.matrix(input_beta_matrix)) {
+    input_beta_matrix <- as.data.frame(input_beta_matrix)
+  }
+  
+  # Calculate the number of rows to include based on the percentage x
+  top_x_percent_count <- ceiling(nrow(input_beta_matrix) * (x / 100))
+  
+  # Calculate the standard deviation of each row (CpG)
+  sd_values <- apply(input_beta_matrix, MARGIN=1, FUN=sd)
+  
+  # Sort standard deviations in decreasing order and get the top x percent names
+  top_names <- names(sort(sd_values, decreasing=TRUE))[1:top_x_percent_count]
+  
+  # Filter the dataframe to include only the top x percent most variable CpGs
+  filtered_beta_matrix <- input_beta_matrix[top_names, ]
+  
+  return(filtered_beta_matrix)
+}
+
+# Example usage:
+# Calculate the number of CpG islands that constitute the top 3%
+# Apply the get_most_variable function to select the top 3% most variable CpG islands
+cpg_beta_ordered <- # (your dataframe should be defined or loaded here)
+top_3_percent_variable_cpg <- get_most_variable(input_beta_matrix = cpg_beta_ordered, x = 3)
+
+
+```
+
+#conversion into M value
+
+```{r}
+# Assuming top_3_percent_variable_cpg is your data frame with beta values
+epsilon <- 1e-10
+
+# Function to convert beta to M values
+convert_beta_to_M <- function(beta_value) {
+  log2((beta_value + epsilon) / (1 - beta_value + epsilon))
+}
+
+# Apply the function to each value in the data frame
+top_3_percent_variable_cpg_M <- apply(top_3_percent_variable_cpg, MARGIN = c(1, 2), FUN = convert_beta_to_M)
+```
+
+
+
+```{r}
+library(pheatmap)
+
+# Store the original column names
+original_columns <- colnames(top_3_percent_variable_cpg_M)
+
+
+
+new_order <- c(1:9, 19:27, 10:18, 28:length(original_columns))
+# Reorder the dataframe columns
+top_3_percent_variable_cpg_M_HPV <- top_3_percent_variable_cpg_M[, new_order]
+
+beta_m <- pheatmap(scale(top_3_percent_variable_cpg_M_HPV), cluster_cols = F)
+```
+
+```{r}
+top_3_percent_variable_cpg <- top_3_percent_variable_cpg[, new_order]
+beta <- pheatmap(scale(top_3_percent_variable_cpg), cluster_cols = F)
+```
+
+```{r}
+top_3_percent_variable_cpg_M_untreated <- top_3_percent_variable_cpg_M[,-c(19:36)]
+beta_m_untreated <- pheatmap(scale(top_3_percent_variable_cpg_M_untreated), cluster_cols = F)
+```
+
+```{r}
+top_3_percent_variable_cpg_untreated <- top_3_percent_variable_cpg[,-c(19:36)]
+beta_untreated <- pheatmap(scale(top_3_percent_variable_cpg_untreated), cluster_cols = F)
+```
+
+
+###lets see al the cpg islands
+```{r}
+top_50_percent_variable_cpg <- get_most_variable(input_beta_matrix = cpg_beta_ordered, x = 50)   
+beta_all <- pheatmap(scale(top_50_percent_variable_cpg), cluster_cols = F)
+```
+
+```{r}
+top_50_percent_variable_cpg_untreated <- top_50_percent_variable_cpg[,-c(19:36)]
+beta_untreated <- pheatmap(scale(top_50_percent_variable_cpg_untreated), cluster_cols = F)
+```
+
+0

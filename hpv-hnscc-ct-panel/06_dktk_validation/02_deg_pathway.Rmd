@@ -1,0 +1,436 @@
+---
+title: "DKTK-ROG validation: cluster-wise DEG + pathway enrichment"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# Differential expression (limma) between K-means clusters of the DKTK-ROG
+# cohort, followed by CAMERA / clusterProfiler pathway enrichment. Inputs
+# come from DKTK_DATA; figures and tables are written to DKTK_OUT.
+source(here::here("config.R"))
+knitr::opts_chunk$set(fig.width = 14, fig.height = 8)
+library(oligo)
+library(biomaRt)
+library(dplyr)
+library(pheatmap)
+library(ggplot2)
+library(reshape2)
+library(limma)
+library(readxl)
+library(tidyr)
+library(data.table)
+```
+
+# Load and preprocess expression data
+
+```{r}
+load(file = file.path(DKTK_DATA, "datarma.rda"))
+boxplot(exprs(data.rma))
+```
+
+```{r}
+probesets <- rownames(data.rma) 
+probesets.corr <- gsub("\\.1", "", probesets)
+rownames(data.rma) <- probesets.corr
+fData(data.rma) <- as.data.frame(probesets.corr)
+```
+
+```{r}
+ensembl <- biomaRt::useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+annotLookup <- biomaRt::getBM(attributes = c("affy_hta_2_0",
+                              "ensembl_gene_id",
+                              "external_gene_name"
+                            ),
+               filters = "with_affy_hta_2_0",
+               values = TRUE,
+               mart = ensembl) 
+```
+
+```{r}
+indicesLookup <- match(probesets.corr, annotLookup$affy_hta_2_0)
+indicesLookup <- data.frame(probesets.corr, annotLookup[indicesLookup,])
+
+indicesLookup$control <- ifelse(
+  is.na(indicesLookup$external_gene_name),
+  ifelse(grepl("(TC.*hg)", probesets.corr), 
+         FALSE, 
+         TRUE),
+  FALSE)
+
+data_dktk.final <- subset(data.rma, !indicesLookup$control)
+```
+
+```{r}
+fData(data_dktk.final) <- left_join(fData(data_dktk.final), indicesLookup[1:4])
+```
+
+```{r}
+result <- tibble(fData(data_dktk.final)$probesets.corr, 
+                 fData(data_dktk.final)$external_gene_name, 
+                 .name_repair = ~ c("Probeset", "External_gene_name"))
+result <- bind_cols(result, as_tibble(exprs(data_dktk.final)))
+
+format_sample_id <- function(id) {
+  prefix <- gsub("(DKTKRO1[ab])(\\d+)", "\\1", id)
+  num <- gsub("(DKTKRO1[ab])(\\d+)", "\\2", id)
+  num_padded <- stringr::str_pad(num, width = 3, pad = "0")
+  formatted_id <- paste0(prefix, num_padded)
+  return(formatted_id)
+}
+
+original_colnames <- colnames(result)
+new_colnames <- gsub("(.+)\\.CEL", "DKTKRO1\\1", original_colnames)
+formatted_colnames <- sapply(new_colnames, format_sample_id)
+colnames(result) <- formatted_colnames
+result <- result %>%
+  dplyr::rename(Probeset = ProbesetProbeset, External_gene_name = External_gene_nameExternal_gene_name)
+```
+
+```{r}
+data_dktk <- result
+data_dktk <- data_dktk %>% filter(External_gene_name != "")
+```
+
+```{r}
+data_dktk <- data.table::data.table(data_dktk)
+
+nondups <- data_dktk[!(
+  duplicated(data_dktk, by = "External_gene_name") | 
+    duplicated(data_dktk, fromLast = TRUE, by="External_gene_name")
+),]
+dups <- data_dktk[(
+  duplicated(data_dktk, by = "External_gene_name") | 
+                 duplicated(data_dktk, fromLast = TRUE, by="External_gene_name")
+),]
+
+log_median <- function(x) {
+  n <- length(x)
+  s <- sort(x)
+  r <- 0:1
+  ifelse(n %% 2 == 1, 
+         s[(n+1)/2], 
+         exp(median(log(s[n/2+r])))
+  )
+}
+
+patient_cols <- which(!(colnames(dups) %in% c("Probeset", "External_gene_name")))
+
+dups <- dups %>% 
+  group_by(External_gene_name) %>%
+  summarise_at(.vars = names(.)[patient_cols],
+               .funs = log_median)
+
+data_dktk <- rbind(nondups[,-1], dups)
+```
+
+# Load clinical data
+
+```{r}
+dktk_adjuvant <- read.csv(file.path(DKTK_DATA, "dktk_adjuvant.csv"), check.names = FALSE)
+
+samples <- colnames(data_dktk)[-1]
+
+dktk_adjuvant_microarray <- dktk_adjuvant %>%
+  filter(`Participant ID` %in% samples)
+```
+
+# Prepare expression and metadata
+
+```{r}
+metadata_adjuvant <- as.data.frame(dktk_adjuvant_microarray)
+rownames(metadata_adjuvant) <- metadata_adjuvant[,1]
+metadata_adjuvant <- metadata_adjuvant[, -1]
+
+data_adjuvant <- as.data.frame(data_dktk)
+rownames(data_adjuvant) <- data_adjuvant[,1]
+data_adjuvant <- data_adjuvant[,-1]
+
+common_row_names <- intersect(colnames(data_adjuvant), rownames(metadata_adjuvant))
+data_adjuvant <- data_adjuvant[, common_row_names]
+
+expression_data_adjuvant <- data.frame(lapply(data_adjuvant, as.numeric), row.names = rownames(data_adjuvant))
+expression_data_adjuvant_t <- t(expression_data_adjuvant)
+
+metadata_adjuvant <- metadata_adjuvant[match(colnames(expression_data_adjuvant), rownames(metadata_adjuvant)), ]
+```
+
+# K-means clustering
+
+```{r}
+final_gene <- c("RIBC2", "TCAM1P", "SMC1B", "STAG3", "SYCP2")
+
+scaled_patients <- scale(expression_data_adjuvant_t[, final_gene], center = TRUE, scale = TRUE)
+
+kmeans_clustering <- function(data) {
+  set.seed(42)
+  kmeans_result <- kmeans(data, centers = 3, nstart = 100, iter.max = 10, algorithm = "Hartigan-Wong")
+  cluster_means <- tapply(rowMeans(data), kmeans_result$cluster, mean)
+  
+  if (cluster_means[1] > cluster_means[2] && cluster_means[1] > cluster_means[3]) {
+    high <- 1; medium <- ifelse(cluster_means[2] > cluster_means[3], 2, 3); low <- ifelse(cluster_means[2] > cluster_means[3], 3, 2)
+  } else if (cluster_means[2] > cluster_means[1] && cluster_means[2] > cluster_means[3]) {
+    high <- 2; medium <- ifelse(cluster_means[1] > cluster_means[3], 1, 3); low <- ifelse(cluster_means[1] > cluster_means[3], 3, 1)
+  } else {
+    high <- 3; medium <- ifelse(cluster_means[1] > cluster_means[2], 1, 2); low <- ifelse(cluster_means[1] > cluster_means[2], 2, 1)
+  }
+  
+  cluster <- as.factor(kmeans_result$cluster)
+  levels(cluster)[high] <- "High CT Panel Expression"
+  levels(cluster)[medium] <- "Intermediate CT Panel Expression"
+  levels(cluster)[low] <- "Low CT Panel Expression"
+  
+  return(list(cluster_labels = cluster, centroids = kmeans_result$centers))
+}
+
+clustering_results <- kmeans_clustering(scaled_patients[, final_gene])
+expression_data_adjuvant_t <- as.data.frame(expression_data_adjuvant_t)
+expression_data_adjuvant_t <- tibble::rownames_to_column(expression_data_adjuvant_t, "Patient_ID")
+expression_data_adjuvant_t$DEG.kmeans <- clustering_results$cluster_labels
+```
+
+# DEG analysis: High vs Low CT panel
+
+```{r}
+md_HL <- metadata_adjuvant %>% mutate(sample_id = rownames(.))
+expression_data_adjuvant_t$sample_id <- expression_data_adjuvant_t$Patient_ID
+
+# Merge to get cluster info
+md_HL <- left_join(md_HL, expression_data_adjuvant_t[, c("sample_id", "DEG.kmeans")], by = "sample_id")
+
+md_HL <- md_HL %>%
+  filter(`DEG.kmeans` %in% c("High CT Panel Expression", "Low CT Panel Expression"))
+
+samples_HL <- md_HL$sample_id
+expr_HL <- expression_data_adjuvant[, samples_HL, drop = FALSE]
+```
+
+# Define DEG function
+
+```{r}
+compare_limma_full <- function(expr_data, md) {
+  CT <- factor(md$`DEG.kmeans`, levels = c("High CT Panel Expression", "Low CT Panel Expression"))
+  levels(CT) <- make.names(levels(CT))
+  
+  design <- model.matrix(~ 0 + CT)
+  colnames(design) <- levels(CT)
+  
+  contrast <- makeContrasts(Low_vs_High = `Low.CT.Panel.Expression` - `High.CT.Panel.Expression`,
+                            levels = design)
+  
+  fit <- lmFit(expr_data, design)
+  fit <- contrasts.fit(fit, contrast)
+  fit <- eBayes(fit)
+  
+  cat("decideTests summary:\n")
+  print(summary(decideTests(fit)))
+  
+  deg <- topTable(fit, n = Inf, adjust.method = "BH")
+  deg <- deg[order(deg$adj.P.Val), ]
+  return(deg)
+}
+```
+
+# Define detection indicators and run DEG
+
+```{r}
+detection_indicators <- list(
+  "P16" = "P16",
+  "HPV16DNA" = "HPV16 DNS",
+  "HPV16RNA" = "HPV16 RNA",
+  "Double_P16_HPV16DNA" = "Double_P16_HPV16DNA",
+  "Double_P16_HPV16RNA" = "Double_P16_HPV16RNA",
+  "Double_HPV16DNA_HPV16RNA" = "Double_HPV16DNA_HPV16RNA",
+  "Triple" = "Triple_Positive",
+  "Any" = "Any_Positive"
+)
+
+# Create detection indicator columns from metadata
+md_HL <- md_HL %>%
+  mutate(
+    P16_col = ifelse(P16 == 1, "Positive", "Negative"),
+    HPV16DNA_col = ifelse(`HPV16 DNS` == 1, "Positive", "Negative"),
+    HPV16RNA_col = ifelse(`HPV16 RNA` == 1, "Positive", "Negative"),
+    Double_P16_HPV16DNA = ifelse(P16 == 1 & `HPV16 DNS` == 1, "Positive", "Negative"),
+    Double_P16_HPV16RNA = ifelse(P16 == 1 & `HPV16 RNA` == 1, "Positive", "Negative"),
+    Double_HPV16DNA_HPV16RNA = ifelse(`HPV16 DNS` == 1 & `HPV16 RNA` == 1, "Positive", "Negative"),
+    Triple_Positive = ifelse(P16 == 1 & `HPV16 DNS` == 1 & `HPV16 RNA` == 1, "Positive", "Negative"),
+    Any_Positive = ifelse(P16 == 1 | `HPV16 DNS` == 1 | `HPV16 RNA` == 1, "Positive", "Negative")
+  )
+
+deg_results_full <- list()
+for(name in names(detection_indicators)) {
+  ind_col <- detection_indicators[[name]]
+  
+  # Map to actual column names in md_HL
+  if(name == "P16") ind_col_actual <- "P16_col"
+  else if(name == "HPV16DNA") ind_col_actual <- "HPV16DNA_col"
+  else if(name == "HPV16RNA") ind_col_actual <- "HPV16RNA_col"
+  else ind_col_actual <- ind_col
+  
+  md_sub <- md_HL %>% filter((!!sym(ind_col_actual)) == "Positive")
+  
+  if(nrow(md_sub) < 10) {
+    cat("Not enough samples for", name, "\n")
+    next
+  }
+  
+  common_samples <- intersect(md_sub$sample_id, colnames(expression_data_adjuvant))
+  md_sub <- md_sub %>% filter(sample_id %in% common_samples)
+  expr_sub <- expression_data_adjuvant[, common_samples, drop = FALSE]
+  expr_sub <- expr_sub[, match(md_sub$sample_id, colnames(expr_sub))]
+  
+  cat("Detection indicator", name, "-> metadata samples:", nrow(md_sub),
+      "and expression columns:", ncol(expr_sub), "\n")
+  
+  deg_full <- compare_limma_full(expr_sub, md_sub)
+  deg_results_full[[name]] <- deg_full
+}
+
+sig_threshold <- 0.05
+sig_counts <- sapply(deg_results_full, function(df) sum(df$adj.P.Val < sig_threshold))
+sig_counts_table <- data.frame(Detection_Indicator = names(sig_counts), Significant_DEG_Count = sig_counts)
+print(sig_counts_table)
+```
+
+# Export DEG tables
+
+```{r}
+for(name in names(deg_results_full)) {
+  df <- deg_results_full[[name]]
+  
+  if(is.null(df) || nrow(df) == 0) {
+    cat("Skipping", name, "as no DEGs found\n")
+    next
+  }
+  
+  df <- df[, c("logFC", "AveExpr", "t", "P.Value", "adj.P.Val")]
+  df$gene_symbol <- rownames(df)
+  df <- df[, c("gene_symbol", "logFC", "AveExpr", "t", "P.Value", "adj.P.Val")]
+  colnames(df) <- c("gene_symbol", "log2FoldChange", "AveExpr", "t", "pvalue", "padj")
+  
+  filename <- file.path(DKTK_OUT, paste0("deg_", name, "_formatted.csv"))
+  write.csv(df, file = filename, row.names = FALSE)
+  
+  cat("Saved DEG table for", name, "as", filename, "\n")
+}
+```
+
+# Pathway analysis with CAMERA
+
+```{r}
+library(msigdbr)
+
+msigdb_hallmark <- msigdbr::msigdbr(species = "Homo sapiens", collection = "H")
+gene_sets <- split(msigdb_hallmark$gene_symbol, msigdb_hallmark$gs_name)
+```
+
+```{r}
+camera_results_list <- list()
+
+for(name in names(deg_results_full)) {
+  if(is.null(deg_results_full[[name]]) || nrow(deg_results_full[[name]]) == 0) {
+    cat("Skipping", name, "as no DEGs found\n")
+    next
+  }
+  
+  ind_col <- detection_indicators[[name]]
+  
+  if(name == "P16") ind_col_actual <- "P16_col"
+  else if(name == "HPV16DNA") ind_col_actual <- "HPV16DNA_col"
+  else if(name == "HPV16RNA") ind_col_actual <- "HPV16RNA_col"
+  else ind_col_actual <- ind_col
+  
+  md_sub <- md_HL %>% filter((!!sym(ind_col_actual)) == "Positive")
+  
+  if(nrow(md_sub) < 10) {
+    cat("Not enough samples for", name, "\n")
+    next
+  }
+  
+  common_samples <- intersect(md_sub$sample_id, colnames(expression_data_adjuvant))
+  if(length(common_samples) < 10) {
+    cat("Not enough common samples for", name, "\n")
+    next
+  }
+  
+  md_sub <- md_sub %>% filter(sample_id %in% common_samples)
+  expr_sub <- expression_data_adjuvant[, common_samples, drop = FALSE]
+  expr_sub <- expr_sub[, match(md_sub$sample_id, colnames(expr_sub))]
+  
+  CT <- factor(md_sub$`DEG.kmeans`, levels = c("High CT Panel Expression", "Low CT Panel Expression"))
+  levels(CT) <- make.names(levels(CT))
+  design_specific <- model.matrix(~ 0 + CT)
+  colnames(design_specific) <- levels(CT)
+  
+  contrast_specific <- makeContrasts(Low_vs_High = `Low.CT.Panel.Expression` - `High.CT.Panel.Expression`,
+                                    levels = design_specific)
+  contrast_vector <- as.numeric(contrast_specific[,1])
+  
+  tryCatch({
+    camera_res <- camera(expr_sub, gene_sets, design_specific, contrast_vector)
+    
+    camera_df <- as.data.frame(camera_res)
+    camera_df$Pathway <- rownames(camera_df)
+    
+    camera_df <- camera_df[, c("Pathway", "NGenes", "Direction", "PValue", "FDR")]
+    
+    camera_results_list[[name]] <- camera_df
+    
+    csv_filename <- file.path(DKTK_OUT, paste0("pathway_analysis_camera_", name, ".csv"))
+    write.csv(camera_df, file = csv_filename, row.names = FALSE)
+    
+    assign(paste0("camera_result_", name), camera_df, envir = .GlobalEnv)
+    
+    cat("Saved pathway analysis for", name, "as", csv_filename, "\n")
+    
+  }, error = function(e) {
+    cat("Error during CAMERA analysis for", name, ":", conditionMessage(e), "\n")
+  })
+}
+```
+
+# Plot top pathways
+
+```{r}
+library(ggplot2)
+library(dplyr)
+
+# Get top 15 pathways for selected methods
+P16_top15 <- camera_result_P16 %>%
+  arrange(PValue) %>%
+  slice_head(n = 15)
+
+HPV16DNA_top15 <- camera_result_HPV16DNA %>%
+  arrange(PValue) %>%
+  slice_head(n = 15)
+
+Any_top15 <- camera_result_Any %>%
+  arrange(PValue) %>%
+  slice_head(n = 15)
+
+selected_camera_results <- list(
+  P16 = P16_top15,
+  HPV16DNA = HPV16DNA_top15,
+  Any = Any_top15
+)
+
+camera_combined_df <- bind_rows(
+  lapply(names(selected_camera_results), function(name) {
+    df <- selected_camera_results[[name]]
+    df$Detection <- name
+    return(df)
+  })
+)
+
+p <- ggplot(camera_combined_df, aes(x = -log10(PValue), y = reorder(Pathway, -log10(PValue)), fill = Direction)) +
+  geom_col() +
+  facet_wrap(~Detection, scales = "free_y") +
+  labs(title = "Top 15 HALLMARK Pathways (CAMERA)",
+       x = "-log10(p-value)",
+       y = NULL,
+       fill = "Direction") +
+  theme_minimal() +
+  theme(strip.text = element_text(size = 12, face = "bold"))
+
+print(p)
+```

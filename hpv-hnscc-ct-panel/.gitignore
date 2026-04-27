@@ -1,0 +1,41 @@
+# R session / state
+.Rproj.user/
+.Rhistory
+.Rapp.history
+.RData
+.Ruserdata
+*.Rproj
+
+# Rendered outputs
+*.html
+*.pdf
+*_cache/
+*_files/
+
+# Data — do not commit raw cohort data
+data/*
+!data/README.md
+!data/.gitkeep
+
+# Results — regenerated locally
+results/*
+!results/.gitkeep
+
+# Notebook / editor scratch
+.ipynb_checkpoints/
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Temp
+*.tmp
+*.swp
+*~
+
+# RnBeads / bioinformatics heavy artefacts
+*.rda
+*.RDS
+*.rds
+*.idat
+reports/

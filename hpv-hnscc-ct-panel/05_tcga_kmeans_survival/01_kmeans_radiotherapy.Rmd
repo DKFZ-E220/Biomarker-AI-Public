@@ -1,0 +1,614 @@
+---
+title: "TCGA-HNSC RT-treated: K-means on the 5-gene CT panel + survival"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# K-means (k = 2) clustering of the RT-treated TCGA-HNSC subset on the
+# 5-gene CT panel (RIBC2, TCAM1P, SMC1B, STAG3, SYCP2), followed by
+# Kaplan-Meier survival analysis (OS, PFS, DSS) stratified on HPV.
+source(here::here("config.R"))
+knitr::opts_chunk$set(fig.width = 14, fig.height = 8)
+```
+
+
+##library
+```{r include=FALSE}
+library(DESeq2)
+
+library(pheatmap)
+library(dplyr)
+library(Rlabkey)
+library(tidyverse)
+library(readxl)
+library(TCGAbiolinks)
+library(biomaRt)
+library(SummarizedExperiment)
+library(stringr)
+library(tidyr)
+library(limma)
+```
+
+
+###  only the counts results of significant genes from enrichment analysis
+
+```{r }
+sig <- read.csv(file.path(TCGA_TX_DATA, "Countsprimarytumormodified.csv"))
+sig = aggregate(sig,FUN = max,by=list(sig$hgnc_symbol))
+sig <- sig[,-1]
+```
+
+
+
+
+```{r}
+read.csv(file.path(TCGA_TX_DATA, "TCGA_metadata_GDC_RPB_combined.csv"), row.names = 1) -> tcga_hnscc_all
+```
+
+# only radiation patients (both HPV+ and HPV-)
+```{r}
+
+
+# Helper to pull off the leading 0/1 from a "0:alive" or "1:dead" string
+parse_status <- function(x) {
+  ifelse(grepl("^[01]:", x),
+         as.numeric(sub(":.*", "", x)),
+         NA_real_)
+}
+
+LTC_tcga_HPV_pos <- tcga_hnscc_all %>%
+  # 1) Convert numeric-month columns
+  mutate(across(
+    c(
+      `Overall.Survival..Months.`,
+      `Progress.Free.Survival..Months.`,
+      `Months.of.disease.specific.survival`
+    ),
+    as.numeric
+  )) %>%
+  # 2) Convert status columns all with the same helper
+  mutate(across(
+    c(
+      `Overall.Survival.Status`,
+      `Progression.Free.Status`,
+      `Disease.specific.Survival.status`
+    ),
+    parse_status
+  )) %>%
+  # 3) Filter for radiation therapy patients (both HPV+ and HPV-)
+  filter(`Radiation.Therapy` == "Yes")
+
+# Now you can plot, summarise, etc.
+hist(LTC_tcga_HPV_pos$`Overall.Survival..Months.`)
+
+
+
+```
+
+
+
+
+```{r}
+# Add a pseudo-count of 1 to all counts
+sig <- sig %>%
+  mutate(across(-1, ~ . + 1))
+# Make the first column the row names
+rownames(sig) <- sig$hgnc_symbol
+
+# Remove the first column (optional)
+sig <- sig[, -1]
+
+
+# Now proceed with the variance stabilizing transformation and heatmap
+vsdsig_tcga <- varianceStabilizingTransformation(object = as.matrix(sig))
+expression_data_tcga_t <- t(vsdsig_tcga)
+```
+
+# Select radiation patients (already filtered above)
+```{r}
+# Check which patients are missing
+patients_in_clinical <- rownames(LTC_tcga_HPV_pos)
+samples_in_expression <- rownames(expression_data_tcga_t)
+
+cat("Patients in clinical data (LTC_tcga_HPV_pos):", length(patients_in_clinical), "\n")
+cat("Samples in expression data (expression_data_tcga_t):", length(samples_in_expression), "\n\n")
+
+# Find common patients
+common_samples <- intersect(patients_in_clinical, samples_in_expression)
+cat("Common samples in both datasets:", length(common_samples), "\n\n")
+
+# Keep only common samples in both datasets
+LTC_tcga_HPV_pos <- LTC_tcga_HPV_pos[rownames(LTC_tcga_HPV_pos) %in% common_samples, ]
+
+expression_data_tcga_t_radiation <- expression_data_tcga_t[
+  rownames(expression_data_tcga_t) %in% common_samples,
+  , drop = FALSE
+]
+
+cat("Final dimensions:\n")
+cat("  LTC_tcga_HPV_pos:", nrow(LTC_tcga_HPV_pos), "rows\n")
+cat("  expression_data_tcga_t_radiation:", nrow(expression_data_tcga_t_radiation), "rows\n")
+
+```
+
+
+```{r}
+final_gene <- c("RIBC2", "TCAM1P", "SMC1B", "STAG3", "SYCP2")
+
+# Scale expression data for the specified genes
+scaled_patients <- scale(expression_data_tcga_t_radiation[, final_gene], center = TRUE, scale = TRUE)
+# Verify scaling (variances should be ~1)
+apply(scaled_patients, 2, var)
+```
+
+```{r}
+# Define a k-means clustering function
+kmeans_clustering <- function(data) {
+  set.seed(42)  # For reproducibility
+  kmeans_result <- kmeans(data, centers = 3, nstart = 100, iter.max = 10, algorithm = "Hartigan-Wong")
+  cluster_means <- tapply(rowMeans(data), kmeans_result$cluster, mean)
+  
+  # Determine which cluster corresponds to high, medium, and low expression
+  if (cluster_means[1] > cluster_means[2] && cluster_means[1] > cluster_means[3]) {
+    high <- 1; medium <- ifelse(cluster_means[2] > cluster_means[3], 2, 3); low <- ifelse(cluster_means[2] > cluster_means[3], 3, 2)
+  } else if (cluster_means[2] > cluster_means[1] && cluster_means[2] > cluster_means[3]) {
+    high <- 2; medium <- ifelse(cluster_means[1] > cluster_means[3], 1, 3); low <- ifelse(cluster_means[1] > cluster_means[3], 3, 1)
+  } else {
+    high <- 3; medium <- ifelse(cluster_means[1] > cluster_means[2], 1, 2); low <- ifelse(cluster_means[1] > cluster_means[2], 2, 1)
+  }
+  
+  # Replace factor levels with descriptive labels
+  cluster <- as.factor(kmeans_result$cluster)
+  levels(cluster)[high] <- "High CT Panel Expression"
+  levels(cluster)[medium] <- "Intermediate CT Panel Expression"
+  levels(cluster)[low] <- "Low CT Panel Expression"
+  
+  return(list(cluster_labels = cluster, centroids = kmeans_result$centers))
+}
+
+# Perform clustering and add the results to expression_data_tcga_t_radiation
+clustering_results <- kmeans_clustering(scaled_patients[, final_gene])
+expression_data_tcga_t_radiation <- as.data.frame(expression_data_tcga_t_radiation)
+expression_data_tcga_t_radiation <- tibble::rownames_to_column(expression_data_tcga_t_radiation, "Patient_ID")
+expression_data_tcga_t_radiation$DEG.kmeans <- clustering_results$cluster_labels
+
+# Check overall mean expression per cluster
+group_means <- aggregate(rowMeans(scaled_patients), 
+                         by = list(expression_data_tcga_t_radiation$DEG.kmeans), 
+                         mean)
+colnames(group_means) <- c("Group", "Overall_Mean_Expression")
+print(group_means)
+```
+
+```{r}
+table(expression_data_tcga_t_radiation$DEG.kmeans)
+```
+
+```{r}
+# Prepare data for plotting by merging scaled values and cluster labels
+cluster <- cbind(scaled_patients[, final_gene], expression_data_tcga_t_radiation[, c("DEG.kmeans", "Patient_ID")])
+dfm <- reshape2::melt(cluster, variable.name = "Gene", value.name = "Expression")
+
+# Convert DEG.kmeans to ordered factor for proper display order
+dfm$DEG.kmeans <- factor(dfm$DEG.kmeans, 
+                         levels = c("High CT Panel Expression", 
+                                   "Intermediate CT Panel Expression", 
+                                   "Low CT Panel Expression"),
+                         ordered = TRUE)
+
+dfm_summary <- dfm %>% 
+  dplyr::group_by(Gene, DEG.kmeans) %>% 
+  dplyr::summarize(n = n(),
+                   Mean = mean(Expression), 
+                   sd = sd(Expression),
+                   se = sd / sqrt(n),
+                   .groups = "drop")
+
+# Plot the mean expression values with error bars, faceted by k-means cluster
+p <- ggplot(dfm_summary, aes(x = Gene, y = Mean, fill = DEG.kmeans)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_errorbar(aes(ymin = Mean - se, ymax = Mean + se),
+                width = 0.2, position = position_dodge(0.9)) +
+  scale_fill_manual(values = c("High CT Panel Expression" = "#7AB2D3", 
+                               "Intermediate CT Panel Expression" = "#E7B800", 
+                               "Low CT Panel Expression" = "#DE3163")) +
+  coord_flip() +
+  facet_grid(rows = vars(DEG.kmeans)) +
+  theme_bw() +
+  theme(axis.text = element_text(size = 10, face = "bold.italic"),
+        axis.text.x = element_text(size = 10),
+        axis.title = element_text(size = 10, face = "bold"),
+        legend.position = "none",
+        strip.text = element_text(size = 10),
+        plot.title = element_text(size = 10, hjust = 0.5, face = "bold")) +
+  ggtitle("Mean expression value of patients clustered \n into 'High/Intermediate/Low CT Panel Expression' groups")
+
+# Save to PDF
+#pdf(file.path(TCGA_KM_OUT, "kmeans_plot.pdf"), width = 3, height = 5)
+print(p)
+#dev.off()
+```
+
+# Optional testing
+
+```{r}
+library(cluster)
+library(ggplot2)
+
+# 1. Run kmeans clustering for k = 3
+# Coerce cluster factor into numeric for metrics
+# Coerce factor labels to numeric (for silhouette)
+cluster_numeric <- as.numeric(expression_data_tcga_t_radiation$DEG.kmeans)
+# Reuse your scaled matrix
+sil <- silhouette(cluster_numeric, dist(scaled_patients[, final_gene]))
+s <- plot(sil, main = "Silhouette Plot for K-means Clusters (k = 3)")
+cat("Average silhouette width:", mean(sil[, 3]), "\n")
+pdf(file.path(TCGA_KM_OUT, "kmeans_tcga_radiotherapy_silhouette.pdf"), width = 3, height = 5)
+print(s)
+
+
+```
+
+
+```{r}
+library(cluster)
+
+# Coerce cluster factor into numeric for metrics
+cluster_numeric <- as.numeric(clustering_results$cluster_labels)
+
+# 1. Silhouette analysis
+sil <- silhouette(cluster_numeric, dist(scaled_patients[, final_gene]))
+plot(sil, main = "Silhouette Plot for K-means Clusters")
+cat("Average silhouette width:", mean(sil[, 3]), "\n")
+```
+
+
+# K-means clustering with k = 2
+
+```{r}
+# --- K-means clustering function for k = 2 with expression-based labeling
+kmeans_clustering_k2 <- function(data) {
+  set.seed(42)
+  kmeans_result <- kmeans(data, centers = 2, nstart = 100, iter.max = 10, algorithm = "Hartigan-Wong")
+  cluster_means <- tapply(rowMeans(data), kmeans_result$cluster, mean)
+
+  # Assign labels based on cluster mean expression
+  if (cluster_means[1] > cluster_means[2]) {
+    high <- 1; low <- 2
+  } else {
+    high <- 2; low <- 1
+  }
+
+  cluster <- as.factor(kmeans_result$cluster)
+  levels(cluster)[high] <- "High CT Panel Expression"
+  levels(cluster)[low]  <- "Low CT Panel Expression"
+
+  return(list(cluster_labels = cluster, centroids = kmeans_result$centers))
+}
+
+# --- Run clustering
+clustering_k2 <- kmeans_clustering_k2(scaled_patients)
+clusters_k2 <- clustering_k2$cluster_labels
+print(table(clusters_k2))
+
+```
+
+```{r}
+library(cluster)
+cluster_numeric_k2 <- as.numeric(clusters_k2)
+sil_k2 <- silhouette(cluster_numeric_k2, dist(scaled_patients[, final_gene]))
+plot(sil_k2, main = "Silhouette Plot for K-means Clusters (k = 2)")
+cat("Average silhouette width (k = 2):", mean(sil_k2[, 3]), "\n")
+
+```
+
+
+
+
+
+
+
+
+#do a survival analysis
+
+```{r}
+
+# Use the Patient_ID from expression data and clusters from k=2 clustering
+clusters_df <- data.frame(Patient_ID = expression_data_tcga_t_radiation$Patient_ID, 
+                          Cluster = clusters_k2)
+
+# Merge with clinical data using Patient_ID
+merged_df <- merge(clusters_df, 
+                   LTC_tcga_HPV_pos,
+                   by.x = "Patient_ID", 
+                   by.y = 0)
+
+```
+
+```{r}
+library(survival)
+library(survminer)
+
+# Create survival object
+surv_object <- Surv(time = merged_df$`Overall.Survival..Months.`, 
+                    event = merged_df$`Overall.Survival.Status`)
+
+# Fit Kaplan-Meier curve
+fit <- survfit(surv_object ~ Cluster, data = merged_df)
+
+# Plot survival curves
+OS <- ggsurvplot(fit, data = merged_df, 
+           pval = TRUE,                      # Display p-value of the log-rank test
+           risk.table = TRUE,                # Add a table of the number of subjects at risk at different times
+           conf.int = TRUE,                  # Show confidence intervals
+           palette = c("#7AB2D3", "#DE3163"), # Colors for the groups (High, Low)
+           xlab = "Time (months)",             # Customize X-axis label
+           ylab = "Survival probability",    # Customize Y-axis label
+           legend.labs = c("High CT Panel Expression", "Low CT Panel Expression"))  # Labels for the legend
+
+print(OS)
+```
+
+#for poster - save to PDF
+```{r}
+# Save the plot to PDF
+pdf(file.path(TCGA_KM_OUT, "tcga_OS_kmeans.pdf"), height = 6, width = 8, onefile = F)
+print(OS)
+dev.off()
+```
+
+
+# progression free
+
+```{r}
+
+# Create survival object
+surv_object <- Surv(time = merged_df$`Progress.Free.Survival..Months.`, event = merged_df$`Progression.Free.Status`)
+
+# Fit Kaplan-Meier curve
+fit <- survfit(surv_object ~ Cluster, data = merged_df)
+
+# Plot survival curves
+ggsurvplot(fit, data = merged_df, 
+           pval = TRUE,                      # Display p-value of the log-rank test
+           risk.table = TRUE,                # Add a table of the number of subjects at risk at different times
+           conf.int = TRUE,                  # Show confidence intervals
+           palette = c("#7AB2D3", "#DE3163"), # Colors for the groups
+           xlab = "Time (months)",             # Customize X-axis label
+           ylab = "Progression Free Survival probability",    # Customize Y-axis label
+           legend.title = "HPV Status",
+           legend.labs = c("High", "Low"))  # Labels for the legend
+```
+
+
+# disease speciific
+
+```{r}
+# Create survival object
+surv_object <- Surv(time = merged_df$`Months.of.disease.specific.survival`, event = merged_df$`Disease.specific.Survival.status`)
+
+# Fit Kaplan-Meier curve
+fit <- survfit(surv_object ~ Cluster, data = merged_df)
+
+# Plot survival curves
+ggsurvplot(fit, data = merged_df, 
+           pval = TRUE,                      # Display p-value of the log-rank test
+           risk.table = TRUE,                # Add a table of the number of subjects at risk at different times
+           conf.int = TRUE,                  # Show confidence intervals
+           palette = c("#7AB2D3", "#DE3163"), # Colors for the groups
+           xlab = "Time (months)",             # Customize X-axis label
+           ylab = "Disease Specific Survival probability",    # Customize Y-axis label
+           legend.title = "HPV Status",
+           legend.labs = c("High", "Low"))  # Labels for the legend
+```
+
+
+#### Heatmap with 5-gene panel and k-means clustering
+
+```{r}
+library(pheatmap)
+
+# Define the 5-gene panel
+gene_panel <- c("RIBC2", "TCAM1P", "SMC1B", "STAG3", "SYCP2")
+
+# Get expression data for these genes and set rownames to Patient_ID
+heatmap_data <- expression_data_tcga_t_radiation[, gene_panel]
+rownames(heatmap_data) <- merged_df$Patient_ID
+
+# Prepare annotations from merged_df (only Cluster and Subtype, no Patient_ID)
+heatmap_anno <- merged_df[, c("Cluster", "Subtype")]
+rownames(heatmap_anno) <- merged_df$Patient_ID
+
+# Convert to character for consistency
+heatmap_anno$Cluster <- as.character(heatmap_anno$Cluster)
+heatmap_anno$Subtype <- as.character(heatmap_anno$Subtype)
+
+# Create annotation colors
+anno_colors <- list(
+  Cluster = c("High CT Panel Expression" = "#7AB2D3", 
+              "Low CT Panel Expression" = "#DE3163"),
+  Subtype = c("HNSC_HPV+" = "#FF6B6B", 
+              "HNSC_HPV-" = "#4ECDC4")
+)
+
+# Create the heatmap
+
+p <- pheatmap(t(heatmap_data),
+         annotation_col = heatmap_anno,
+         annotation_colors = anno_colors,
+         scale = "row",
+         clustering_distance_rows = "euclidean",
+         clustering_distance_cols = "euclidean",
+         show_rownames = TRUE,
+         show_colnames = FALSE,
+         main = "5-Gene Panel Expression Heatmap",
+         fontsize = 10)
+print(p)
+```
+
+```{r}
+# Create the heatmap
+pdf(file.path(TCGA_KM_OUT, "tcga_heatmap_5gene_panel.pdf"), width = 12, height = 8)
+pheatmap(t(heatmap_data),
+         annotation_col = heatmap_anno,
+         annotation_colors = anno_colors,
+         scale = "row",
+         clustering_distance_rows = "euclidean",
+         clustering_distance_cols = "euclidean",
+         show_rownames = TRUE,
+         show_colnames = FALSE,
+         main = "5-Gene Panel Expression Heatmap",
+         fontsize = 10)
+#dev.off()
+```
+#### Survival analysis - HPV+ patients only
+
+```{r}
+# Filter for HPV+ patients only
+hpv_pos_df <- merged_df %>%
+  filter(Subtype == "HNSC_HPV+")
+
+# Create survival object for HPV+ patients
+surv_object_hpv <- Surv(time = hpv_pos_df$`Overall.Survival..Months.`, 
+                        event = hpv_pos_df$`Overall.Survival.Status`)
+
+# Fit Kaplan-Meier curve
+fit_hpv <- survfit(surv_object_hpv ~ Cluster, data = hpv_pos_df)
+
+# Plot survival curves for HPV+ only
+OS_hpv <- ggsurvplot(fit_hpv, data = hpv_pos_df, 
+           pval = TRUE,
+           risk.table = TRUE,
+           conf.int = FALSE,
+           palette = c("#7AB2D3", "#DE3163"),
+           xlab = "Time (months)",
+           ylab = "Survival probability",
+           legend.labs = c("High CT Panel Expression", "Low CT Panel Expression"))
+
+print(OS_hpv)
+```
+
+#for poster - save to PDF
+```{r}
+# Save the HPV+ survival plot to PDF
+pdf(file.path(TCGA_KM_OUT, "tcga_OS_kmeans_HPV_positive.pdf"), height = 6, width = 8, onefile = F)
+print(OS_hpv)
+#dev.off()
+```
+
+#### Progression Free Survival - HPV+ patients only
+
+```{r}
+# Create survival object for PFS in HPV+ patients
+surv_object_pfs_hpv <- Surv(time = hpv_pos_df$`Progress.Free.Survival..Months.`, 
+                             event = hpv_pos_df$`Progression.Free.Status`)
+
+# Fit Kaplan-Meier curve
+fit_pfs_hpv <- survfit(surv_object_pfs_hpv ~ Cluster, data = hpv_pos_df)
+
+# Plot PFS curves for HPV+ only
+PFS_hpv <- ggsurvplot(fit_pfs_hpv, data = hpv_pos_df, 
+           pval = TRUE,
+           risk.table = TRUE,
+           conf.int = FALSE,
+           palette = c("#7AB2D3", "#DE3163"),
+           xlab = "Time (months)",
+           ylab = "Progression Free Survival probability",
+           legend.labs = c("High CT Panel Expression", "Low CT Panel Expression"))
+
+print(PFS_hpv)
+```
+
+```{r}
+# Save the HPV+ PFS plot to PDF
+pdf(file.path(TCGA_KM_OUT, "tcga_PFS_kmeans_HPV_positive.pdf"), height = 6, width = 8, onefile = F)
+print(PFS_hpv)
+dev.off()
+```
+
+#### Disease Specific Survival - HPV+ patients only
+
+```{r}
+# Create survival object for DSS in HPV+ patients
+surv_object_dss_hpv <- Surv(time = hpv_pos_df$`Months.of.disease.specific.survival`, 
+                             event = hpv_pos_df$`Disease.specific.Survival.status`)
+
+# Fit Kaplan-Meier curve
+fit_dss_hpv <- survfit(surv_object_dss_hpv ~ Cluster, data = hpv_pos_df)
+
+# Plot DSS curves for HPV+ only
+DSS_hpv <- ggsurvplot(fit_dss_hpv, data = hpv_pos_df, 
+           pval = TRUE,
+           risk.table = TRUE,
+           conf.int = FALSE,
+           palette = c("#7AB2D3", "#DE3163"),
+           xlab = "Time (months)",
+           ylab = "Disease Specific Survival probability",
+           legend.labs = c("High CT Panel Expression", "Low CT Panel Expression"))
+
+print(DSS_hpv)
+```
+
+```{r}
+# Save the HPV+ DSS plot to PDF
+pdf(file.path(TCGA_KM_OUT, "tcga_DSS_kmeans_HPV_positive.pdf"), height = 6, width = 8, onefile = F)
+print(DSS_hpv)
+dev.off()
+```
+
+#### Faceted Survival Plot with Risk Tables - HPV+ Patients Only
+
+```{r}
+# Add survival type label to HPV+ patients data
+hpv_os <- hpv_pos_df %>%
+  mutate(Detection = "Overall Survival",
+         Time = `Overall.Survival..Months.`,
+         Status = `Overall.Survival.Status`)
+
+hpv_pfs <- hpv_pos_df %>%
+  mutate(Detection = "Progression-Free Survival",
+         Time = `Progress.Free.Survival..Months.`,
+         Status = `Progression.Free.Status`)
+
+hpv_dss <- hpv_pos_df %>%
+  mutate(Detection = "Disease-Specific Survival",
+         Time = `Months.of.disease.specific.survival`,
+         Status = `Disease.specific.Survival.status`)
+
+# Combine all into one dataset for HPV+ patients
+cohort_combined <- bind_rows(hpv_os, hpv_pfs, hpv_dss)
+cohort_combined$Detection <- factor(cohort_combined$Detection,
+                                    levels = c("Overall Survival", "Progression-Free Survival", "Disease-Specific Survival"))
+```
+
+```{r}
+# Fit survival models for all three types in HPV+ patients
+fit_all <- survfit(Surv(Time, Status) ~ Cluster, data = cohort_combined)
+
+# Create faceted survival plot
+facet_plot <- ggsurvplot_facet(
+  fit = fit_all,
+  data = cohort_combined,
+  facet.by = "Detection",
+  palette = c("#7AB2D3", "#DE3163"),
+  conf.int = FALSE,
+  pval = TRUE,
+  risk.table = TRUE,
+  legend.title = "Groups",
+  legend.labs = c("High CT Panel Expression", "Low CT Panel Expression"),
+  xlab = "Months after diagnosis",
+  ylab = "Survival Probability",
+  short.panel.labs = TRUE,
+  scales = "fixed"
+) +
+  theme(
+    legend.position = "bottom",
+    strip.text = element_text(size = 12, face = "bold"),
+    plot.margin = margin(10, 30, 10, 10)
+  )
+
+print(facet_plot)
+
+# Save to PDF
+ggsave(file.path(TCGA_KM_OUT, "TCGA_survival_CT_genes_faceted_HPV_positive.pdf"), facet_plot, width = 15, height = 6)
+```

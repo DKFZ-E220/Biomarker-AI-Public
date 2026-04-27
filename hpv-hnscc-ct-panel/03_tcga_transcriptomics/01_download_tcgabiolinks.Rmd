@@ -1,0 +1,228 @@
+---
+title: "TCGA-HNSC: retrieve raw counts via TCGAbiolinks"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# Downloads TCGA-HNSC primary tumour STAR counts via TCGAbiolinks,
+# annotates Ensembl -> HGNC via biomaRt and writes both the raw and
+# annotated count matrices to TCGA_TX_DATA.
+source(here::here("config.R"))
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Loading of package TCGAbiolink (download raw data)
+
+```{r}
+BiocManager::install("BioinformaticsFMRP/TCGAbiolinksGUI.data")
+BiocManager::install("BioinformaticsFMRP/TCGAbiolinks")
+```
+
+
+```{r}
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install("TCGAbiolinks")
+```
+
+```{r}
+library (TCGAbiolinks)
+```
+
+
+Specification of data search, we store the specifications in query 
+Possible specifications (look in the GDC portal): GDCquery(
+  project,
+  data.category,
+  data.type,
+  workflow.type,
+  legacy = FALSE,
+  access,
+  platform,
+  file.type,
+  barcode,
+  data.format,
+  experimental.strategy,
+  sample.type
+)
+
+In this case selecting head and neck cancer, transcriptome profiling data --> gene expression quatification, data type in counts.
+
+```{r}
+query <- GDCquery(project = 'TCGA-HNSC',
+data.category = "Transcriptome Profiling",
+data.type = "Gene Expression Quantification",
+workflow.type = "STAR - Counts")
+```
+
+Obtaining sample names from the query file (column cases)
+
+```{r}
+samplesDown <- getResults (query, cols = c('cases'))
+```
+
+Selecting the samples that come from "Primary Solid Tumor" (typesample = "TP") among all the samples selected.
+
+```{r}
+dataSmTP <- TCGAquery_SampleTypes (barcode = samplesDown, typesample = 'TP')
+```
+
+
+Searching in the database for the selected TP samples:
+
+```{r}
+queryDown <- GDCquery(project = 'TCGA-HNSC',
+data.category = "Transcriptome Profiling",
+data.type = "Gene Expression Quantification",
+workflow.type = "STAR - Counts",
+barcode = c(dataSmTP))
+```
+
+Once the search is defined then we obtain the data with GSCdownload, it downloads itself into a new directory in the working directory called GDC data, it can be changed in the function:
+
+```{r}
+GDCdownload(queryDown)
+```
+
+GDCprepare converts the data downloaded into an R file
+
+```{r}
+HNSC_STAR <- GDCprepare(queryDown, save = TRUE, save.filename =
+file.path(TCGA_TX_DATA, "TCGA_HNSC_STAR.rda"))
+```
+
+Extracting the counts (under assay) using SummarizedExperiment from the HNSC_HTseqSE object
+
+```{r}
+Counts <- as.data.frame(SummarizedExperiment::assay(HNSC_STAR ))
+```
+
+```{r}
+clinical_data <- as.data.frame(SummarizedExperiment::colData(HNSC_STAR))
+clinical_data <- apply(clinical_data,2,as.character)
+```
+
+```{r}
+write.csv(clinical_data, file = file.path(TCGA_TX_DATA, 'HNSC_TP_Clinical_data.csv'), row.names = FALSE)
+```
+                                                                                                 
+
+
+Writing the table into the working directory:
+
+```{r}
+write.csv(Counts, file = file.path(TCGA_TX_DATA, 'HNSC_TP_Counts.csv'))
+```
+
+Renaming the columns so they have matching names
+
+```{r}
+colnames <- substr(colnames(Counts), 1, 12)
+colnames <- gsub("-", ".", colnames)
+colnames(Counts) <- colnames
+head(Counts)
+```
+
+Ordering the count table in the same alphanumeric way as the sample information table
+
+```{r}
+Counts <- Counts[ , order(names(Counts))]
+```
+
+Writing table in csv format into the working directory so its easier to get it in further uses
+
+```{r}
+## Here you insert the pathway and filename you desire :)
+
+write.csv(as.data.frame(Counts),
+          file.path(TCGA_TX_DATA, "CountsPrimarytumor.csv"))
+```
+
+
+
+
+#Conversion into gene symbols
+```{r}
+CountsTP <- read.csv(file.path(TCGA_TX_DATA, "CountsPrimarytumor.csv"))
+# Remove version numbers from Ensemble IDs
+CountsTP$X <- sub("\\..*", "", CountsTP$X)
+colnames(CountsTP)[1] <- "ensembl_id"
+
+CountsTP = aggregate(CountsTP,FUN = max,by=list(CountsTP$ensembl_id))
+
+library(biomaRt)
+library(dplyr)
+
+# Assuming 'CountsTP' is your data frame with ensemble IDs as row names
+ensml <- CountsTP$ensembl_id
+
+
+# Create a biomart object
+mart <- useMart(biomart = 'ensembl', dataset = "hsapiens_gene_ensembl", host = "https://www.ensembl.org")
+
+# Use a mirror site for Ensembl in case the above code deosnt work
+#mart <- useMart(biomart = 'ensembl', dataset = "hsapiens_gene_ensembl", host = "https://useast.ensembl.org")  
+#mart <- useMart(biomart = 'ensembl', dataset = "hsapiens_gene_ensembl", host = "https://useast.ensembl.org")  
+#mart <- useMart(biomart = 'ensembl', dataset = "hsapiens_gene_ensembl", host = "https://asia.ensembl.org")  
+
+# Get gene IDs and symbols
+
+Ensemble_gene_IDs <- getBM(
+  attributes = c("ensembl_gene_id", "hgnc_symbol"),
+  filters = 'ensembl_gene_id',
+  values = ensml,
+  mart = mart
+)
+
+# Fill NA values in 'hgnc_symbol' with values from 'ensembl_gene_id'
+Ensemble_gene_IDs <- Ensemble_gene_IDs %>%
+  mutate(hgnc_symbol = if_else(hgnc_symbol == "", as.character(ensembl_gene_id), as.character(hgnc_symbol)))
+
+head(Ensemble_gene_IDs)
+
+merged_data <- left_join(CountsTP, Ensemble_gene_IDs %>% dplyr::select(ensembl_gene_id, hgnc_symbol), 
+                         by = c("ensembl_id" = "ensembl_gene_id"))
+
+CountsTP_common <- merged_data[,-c(1:2)]
+
+CountsTP_common <- CountsTP_common %>%
+  dplyr::select(hgnc_symbol, everything())
+write.csv(CountsTP_common, file.path(TCGA_TX_DATA, "Countsprimarytumormodified.csv"), row.names = FALSE)
+```
+
+
+
+Now we see that we have TCGA counts file from the TCGA, also clinical file from the Radplanbio, lets take the file only available for HPV and then analyze them for PCA
+
+```{r}
+#order the column
+
+
+# Rename the dataframe
+CountsTP_genenames <- CountsTP_common
+
+# Assuming CountsTP_genenames is your dataframe
+CountsTP_genenames <- CountsTP_genenames %>%
+  dplyr::rename(gene_symbol = hgnc_symbol)
+
+
+CountsTP_genenames <- CountsTP_genenames[order(CountsTP_genenames$gene_symbol), ]
+
+CountsTP_genenames_sample <- CountsTP_genenames[,-1]
+gene_symbol <- CountsTP_genenames[,1]
+
+
+# Order column names alphabetically
+CountsTP_genenames_sample <- CountsTP_genenames_sample[, sort(names(CountsTP_genenames_sample))]
+
+CountsTP_genenames <- cbind(gene_symbol, CountsTP_genenames_sample)
+
+
+
+
+
+```
+
+
+
