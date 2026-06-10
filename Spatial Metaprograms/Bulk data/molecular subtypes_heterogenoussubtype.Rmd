@@ -1,0 +1,357 @@
+---
+title: "molecular subtype"
+output: html_document
+date: "2023-10-21"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+
+
+##new code after steffen's advice
+
+```{r}
+# Import necessary libraries
+library(readr)
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(DESeq2)
+library(dplyr)
+
+
+```
+
+
+
+#check with maria's hypoxia
+
+```{r}
+# Import necessary libraries
+library(readr)
+library(readxl)
+library(dplyr)
+library(tidyr)
+
+# Read the gene expression matrix from the CSV file
+gene_expression_matrix <- read_csv("countall.csv")
+gene_expression_matrix <- as.data.frame(gene_expression_matrix)
+rownames(gene_expression_matrix) <- gene_expression_matrix$Genes
+gene_expression_matrix <- gene_expression_matrix[,-1]
+gene_expression_matrix <- varianceStabilizingTransformation(object = as.matrix(gene_expression_matrix))
+# Function to perform median centering
+median_center <- function(x) {
+    return(x - median(x, na.rm = TRUE))
+}
+
+# Apply median centering to each column of the sst_rma
+gene_expression_matrix <- apply(gene_expression_matrix, 1, median_center)
+gene_expression_matrix <- t(gene_expression_matrix)
+
+# Read the centroid values from the Excel file
+centroid_values <- read_excel('updated_centroid_values.xlsx', sheet = 'Sheet1')
+centroid_values <- as.data.frame(centroid_values)
+rownames(centroid_values) <- centroid_values$Gene_Symbol
+centroid_values <- centroid_values[,-1]
+
+
+# Filter both matrices to only include matching genes
+common_genes <- intersect(rownames(gene_expression_matrix), rownames(centroid_values))
+filtered_gene_expression_matrix <- gene_expression_matrix[common_genes, ]
+filtered_centroid_values <- centroid_values[common_genes, ]
+
+# Initialize result variables
+num_samples <- ncol(filtered_gene_expression_matrix)
+num_centroids <- ncol(filtered_centroid_values)
+correlation_matrix <- matrix(NA, nrow = num_samples, ncol = num_centroids)
+colnames(correlation_matrix) <- colnames(filtered_centroid_values)
+rownames(correlation_matrix) <- colnames(filtered_gene_expression_matrix)
+
+
+
+# Calculate the Pearson correlation between each sample and each centroid
+for (i in 1:num_samples) {
+  for (j in 1:num_centroids) {
+    sample_vec <- filtered_gene_expression_matrix[, i]
+    centroid_vec <- filtered_centroid_values[, j]
+    correlation_matrix[i, j] <- cor(sample_vec, centroid_vec, method = "pearson")
+  }
+}
+
+# Assign each sample to the subtype with the highest Pearson correlation without post-processing
+raw_assigned_clusters <- apply(correlation_matrix, 1, which.max)
+raw_assigned_cluster_names <- colnames(filtered_centroid_values)[raw_assigned_clusters]
+
+# Create the raw dataframe without post-processing
+raw_result_hypoxia <- data.frame(Sample = colnames(filtered_gene_expression_matrix), 
+                         Subtype = raw_assigned_cluster_names,
+                         MaxCorrelation = apply(correlation_matrix, 1, max))
+
+# Display the raw dataframe
+print(raw_result_hypoxia)
+# Postprocessing to assign samples to clusters
+assigned_clusters <- apply(correlation_matrix, 1, function(row) {
+  if (max(row) > 0.2 && max(row) - sort(row, decreasing = TRUE)[2] > 0.2) {
+    return(which.max(row))
+  } else {
+    return(NA)
+  }
+})
+
+assigned_cluster_names <- ifelse(is.na(assigned_clusters), "Heterogenous Subtypes", colnames(filtered_centroid_values)[assigned_clusters])
+
+# Create the final dataframe
+final_result_hypoxia <- data.frame(Sample = colnames(filtered_gene_expression_matrix), Subtype = assigned_cluster_names)
+
+# Create a new column "Cell Line" based on the "Sample" column
+final_result_hypoxia$"Cell Line" <- dplyr::case_when(
+  grepl("FaDu", final_result_hypoxia$Sample, ignore.case = TRUE) ~ "FaDu",
+  grepl("SAS", final_result_hypoxia$Sample, ignore.case = TRUE) ~ "SAS",
+  grepl("Cal33", final_result_hypoxia$Sample, ignore.case = TRUE) ~ "Cal33",
+  grepl("SAT", final_result_hypoxia$Sample, ignore.case = TRUE) ~ "SAT",
+  grepl("utscc45", final_result_hypoxia$Sample, ignore.case = TRUE) ~ "UTSCC45",
+  TRUE ~ NA_character_  # For samples that don't match any cell line
+)
+
+
+# Display the final dataframe
+print(final_result_hypoxia)
+type_counts <- table(final_result_hypoxia$Subtype)
+print(type_counts)
+
+```
+
+# combine all 4 files
+```{r}
+# Add the 'project' column to each dataframe before combining
+final_result$Project <- "HPV"
+final_result_egfr$Project <- "EGFR"
+final_result_parpi$Project <- "PARPi"
+final_result_hypoxia$Project <- "Hypoxia"
+
+# Combine all dataframes into one
+combined_result <- dplyr::bind_rows(final_result, 
+                                    final_result_egfr, 
+                                    final_result_parpi, 
+                                    final_result_hypoxia)
+
+# Display the combined dataframe
+print(combined_result)
+
+```
+
+
+
+# make some plot
+```{r}
+
+
+# Create the plot with adjustments for better readability
+combined_plot <- ggplot(combined_result, aes(x = "Cell Line", fill = Subtype)) +
+  geom_bar() +
+  facet_wrap(~Project) +  # Facets for Raw and Final
+  theme_minimal() +
+  labs(title = "Subtype Distribution by Project and Result Type", 
+       x = "Subtype", 
+       y = "Frequency") +
+  scale_fill_manual(values = c("#F0E442", "#0072B2", "#D55E00", "#CC79A7", 
+                               "#009E73", "#999999", "#E69F00", "#56B4E9", 
+                               "#332288", "#88CCEE")) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))  # Rotate x-axis labels
+
+# Save the plot as PNG
+
+# Save the plot as PDF
+combined_plot
+```
+
+
+```{r}
+combined_plot_cellline <- ggplot(combined_result, aes(x = "Cell Line", fill = Subtype )) +
+  geom_bar() +
+  facet_wrap(~Project) +  # Facets for Raw and Final
+  theme_minimal() +
+  labs(title = "Subtype Distribution by Project and Result Type", x = "Subtype", y = "Frequency")+scale_fill_manual(values = c("#E69F00", "#56B4E9", "#1B4242", "#009E73", 
+                             "#F0E442", "#0072B2", "#D55E00", "#CC79A7", 
+                             "#999999", "#6F6F6F", "#AA4499", "#332288", "#88CCEE"))
+
+
+print(combined_plot_cellline)
+
+
+```
+# heatmap
+
+```{r}
+library(reshape2)
+
+# Prepare data for heatmap
+heatmap_data <- combined_result %>%
+  dplyr::count(Cell_Line, Subtype, Type) %>%
+  reshape2::dcast(Cell_Line + Type ~ Subtype, value.var = "n", fill = 0)
+
+# Create heatmap
+library(pheatmap)
+pheatmap(as.matrix(heatmap_data[,-(1:2)]), 
+         cluster_rows = FALSE, 
+         cluster_cols = TRUE, 
+         annotation_row = heatmap_data[, 1:2],
+         color = colorRampPalette(c("white", "blue"))(50),
+         main = "Subtype Distribution Heatmap")
+
+```
+
+
+# only subtype raw
+
+```{r}
+library(dplyr)
+library(ggalluvial)
+
+
+alluvial_plot_raw <- ggplot(combined_result, 
+                            aes(axis1 = `Cell Line`, axis2 = Subtype, y = 1, fill = Subtype)) +
+  geom_alluvium(aes(fill = Subtype)) +  # Alluvial plot for Subtype
+  geom_stratum(
+    aes(color = after_stat(stratum)),  # Border color for Cell Line
+    fill = "white",  # White fill for Cell Line strata
+    width = 1/8,
+    show.legend = FALSE  # Hide Cell Line legend
+  ) +
+  geom_text(stat = "stratum", aes(label = after_stat(stratum)), size = 3.5) +  # Adjust font size for clarity
+  scale_x_discrete(labels = c("Tumor Models", "Subtype"), expand = c(0.1, 0.1)) +
+  theme_minimal(base_family = "Arial") +  # Set Arial as the font
+  theme(
+    axis.title = element_text(face = "bold", size = 14),  # Bold for axis titles
+    axis.text = element_text(size = 12),  # Font size for axis text
+    legend.text = element_text(size = 12),  # Font size for legend text
+    legend.title = element_text(size = 14),  # Font size for legend title
+    plot.title = element_text(face = "bold", size = 16, hjust = 0.5)  # Bold and centered title
+  ) +
+  labs(
+    title = "Alluvial Plot of Subtype Raw Distribution",
+    x = "Stages (Tumor Models -> Subtype)",
+    y = "Samples"
+  ) +
+  scale_fill_manual(values = c(
+    "Atypical" = "#E69F00", "Basal" = "#56B4E9", "Classical" = "#1B4242", 
+    "Mesenchymal" = "#009E73", "Heterogenous Subtypes" = "#F0E442" 
+    
+  )) +  # Subtype-specific colors
+  scale_color_manual(values = c(
+    "Cal33" = "#E41A1C", "FaDu" = "#377EB8", "SAS" = "#4DAF4A", 
+    "SAT" = "#984EA3", "UTSCC45" = "#FF7F00", "UTSCC14" = "#FFFF33", 
+    "UTSCC5" = "#A65628", "UTSCC8" = "#F781BF", "XF354" = "#999999",
+    "UMSCC47" = "#66C2A5", "UPCI154" = "#FC8D62", "UDSCC2" = "#8DA0CB"
+  ))  # Cell Line border colors
+
+# Modify the long Subtype label to include a line break
+combined_result$Subtype <- gsub("Heterogenous Subtypes", "Heterogenous\nSubtypes", combined_result$Subtype)
+
+print(alluvial_plot_raw)
+# Save the plot as PNG
+ggsave("alluvial.png", plot = alluvial_plot_raw, width = 15, height = 10, dpi = 300)
+
+# Install and load extrafont if not already installed
+if (!requireNamespace("extrafont", quietly = TRUE)) {
+  install.packages("extrafont")
+}
+library(extrafont)
+
+# Import system fonts (this needs to be done only once)
+font_import(prompt = FALSE)
+loadfonts(device = "pdf")
+
+# Save the plot as a PDF
+ggsave("alluvial.pdf", plot = alluvial_plot_raw, width = 15, height = 10, device = cairo_pdf)
+
+
+
+```
+
+
+```{r}
+# Combined facet plot
+project <- ggplot(combined_result, aes(x = Subtype, fill = Project)) +
+  geom_bar() +
+  facet_wrap(~Type) +  # Facets for Raw and Final
+  theme_minimal() + labs(title = "Subtype Distribution by Project and Result Type", x = "Subtype", y = "Frequency")+scale_fill_manual(values=c( "#E69F00", "#56B4E9","#1B4242","#CC79A7"))
+print(project)
+```
+
+
+##Facet with only common cell_lines
+
+```{r}
+common_cell_lines <- combined_result %>%
+  filter(Cell_Line %in% c("FaDu", "Cal33", "SAS"))
+# Create the facet plot
+common_cell_line_plot <- ggplot(common_cell_lines, aes(x = Subtype, fill = Project)) +
+  geom_bar() +
+  facet_grid(~Cell_Line) +  # Faceting by Cell Line
+  theme_minimal() +
+  labs(title = "Subtype Distribution by Common Cell Lines Across Projects", 
+       x = "Subtype", y = "Frequency") +
+  scale_fill_manual(values = c("#E69F00", "#56B4E9", "#1B4242", "#009E73", 
+                             "#F0E442", "#0072B2", "#D55E00", "#CC79A7", 
+                             "#999999", "#6F6F6F", "#AA4499", "#332288", "#88CCEE"))
+
+
+print(common_cell_line_plot)
+
+```
+
+```{r}
+
+
+common_cell_line_plot <- ggplot(common_cell_lines, aes(x = Subtype, fill = Project)) +
+  geom_bar() +
+  facet_grid(Cell_Line ~ Type) +  # Faceting by Cell Line and Type
+  theme_minimal() +
+  theme(
+    panel.spacing = unit(1, "lines"),  # Adjust spacing between facets
+    panel.border = element_rect(colour = "black", fill = NA, size = 1)  # Add borders
+  ) +
+  labs(title = "Subtype Distribution by Common Cell Lines Across Projects and Result Type", 
+       x = "Subtype", y = "Frequency") +
+  scale_fill_manual(values = c("#E69F00", "#56B4E9", "#1B4242", "#009E73", 
+                             "#F0E442", "#0072B2", "#D55E00", "#CC79A7", 
+                             "#999999", "#6F6F6F", "#AA4499", "#332288", "#88CCEE"))
+
+
+print(common_cell_line_plot)
+
+
+```
+
+```{r}
+library(pheatmap)
+
+filtered_gene_expression_matrix <- filtered_gene_expression_matrix[complete.cases(filtered_gene_expression_matrix), ]
+# Example: Replace NAs with column means
+na_replace <- function(x) replace(x, is.na(x), mean(x, na.rm = TRUE))
+filtered_gene_expression_matrix <- apply(filtered_gene_expression_matrix, 2, na_replace)
+
+
+
+# Annotate samples with their assigned subtypes
+annotation <- data.frame(Subtype = final_result$Subtype)
+rownames(annotation) <- final_result$Sample
+
+# Generate the heatmap
+pheatmap(filtered_gene_expression_matrix, 
+         annotation_col = annotation, 
+         scale = "row", # Scale genes to have mean=0 and variance=1
+         clustering_distance_rows = "euclidean", 
+         clustering_distance_cols = "euclidean", 
+         clustering_method = "complete", # Use complete linkage for hierarchical clustering
+         show_rownames = FALSE, # Hide row names (genes) for clarity, you can set it to TRUE if you prefer
+         show_colnames = TRUE, # Show column names (samples)
+         annotation_legend = TRUE # Show legend for annotations
+)
+
+```

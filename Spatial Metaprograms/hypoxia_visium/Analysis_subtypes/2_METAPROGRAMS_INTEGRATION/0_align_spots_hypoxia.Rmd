@@ -1,0 +1,279 @@
+---
+title: "Align Tissue Positions with Hypoxia Data"
+subtitle: "All Available Samples - Dynamic Discovery"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 2
+    theme: cosmo
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = FALSE)
+```
+
+## Overview
+
+This document automatically discovers and aligns all available samples from the parallel_results directory with hypoxia registration data. It scans for tissue position files and corresponding hypoxia files.
+
+---
+
+## Load Libraries
+
+```{r load-libraries}
+library(tidyverse)
+```
+
+---
+
+## Define Alignment Function
+
+```{r define-function}
+# Function to align and merge spatial data
+align_spots_with_hypoxia <- function(tissue_pos_file, hypoxia_file, sample_name) {
+  
+  # Read files
+  tissue_pos <- read_csv(tissue_pos_file, show_col_types = FALSE)
+  hypoxia <- read_csv(hypoxia_file, show_col_types = FALSE)
+  
+  # Filter tissue positions for in_tissue == 1 (tissue-only)
+  tissue_in <- tissue_pos |>
+    filter(in_tissue == 1) |>
+    mutate(sample = sample_name)
+  
+  # Rename updated column to match downstream expectations
+  if ("hypoxia_label_25" %in% colnames(hypoxia)) {
+    hypoxia <- hypoxia |> rename(hypoxia_label = hypoxia_label_25)
+  }
+
+  # Add sample to hypoxia data to prevent cross-sample contamination
+  hypoxia <- hypoxia |>
+    mutate(sample = sample_name)
+  
+  # Merge on pixel coordinates (unique spatial identifier within sample)
+  # Join on: pixel_row, pixel_col, and sample name
+  merged <- tissue_in |>
+    left_join(
+      hypoxia,
+      by = c("pxl_row_in_fullres", "pxl_col_in_fullres", "sample"),
+      relationship = "one-to-one"
+    )
+  
+  return(merged)
+}
+```
+
+---
+
+## Discover Available Samples
+
+```{r discover-samples}
+# Define base paths
+source(here::here("config.R"))  # defines DATA_DIR, RESULTS_DIR, ANALYSIS_SUBTYPES_DIR
+tissue_pos_dir <- file.path(DATA_DIR, "SPT/samples_3.3.1")
+hypoxia_dir <- file.path(DATA_DIR, "SPT/Hypoxia_registration_SPT_results/hypoxia_spots_updated")
+
+# Get all sample directories (one level deep from samples_3.3.1)
+all_sample_dirs <- list.dirs(tissue_pos_dir, full.names = FALSE, recursive = FALSE)
+all_sample_dirs <- all_sample_dirs[all_sample_dirs != ""]  # Remove empty
+
+cat("Found", length(all_sample_dirs), "sample directories\n\n")
+
+# Discover all hypoxia files
+hypoxia_files <- list.files(hypoxia_dir, pattern = "^tp_.*\\.csv$", 
+                            full.names = TRUE)
+cat("Found", length(hypoxia_files), "hypoxia files\n")
+cat("Hypoxia samples:", paste(sort(gsub("tp_|.csv", "", basename(hypoxia_files))), collapse = ", "), "\n\n")
+
+# Extract sample names and build mapping - ONLY include if hypoxia data exists
+samples <- list()
+
+for (sample_name in all_sample_dirs) {
+  # Build tissue_pos path for this sample - ONLY use outs/spatial path
+  tissue_pos_file <- file.path(tissue_pos_dir, sample_name, "outs", "spatial", "tissue_positions.csv")
+  
+  if (file.exists(tissue_pos_file)) {
+    # Extract identifier from sample name
+    # E.g., N150a014 from N150a014rep_FaDu_SPT_A1 or N165a002 from N165a002_SAT_SPT_C1
+    sample_id <- sub("^(N[0-9]+[a-z][0-9]+).*", "\\1", sample_name)
+    
+    # Look for EXACT matching hypoxia file
+    hyp_file <- file.path(hypoxia_dir, paste0("tp_", sample_id, ".csv"))
+    
+    if (file.exists(hyp_file)) {
+      # Extract cell line using SAME pattern as QC script
+      extracted_cell_line <- gsub(".*_(FaDu|UT5|Cal33|UT8|SAS|UT45|SAT).*", "\\1", sample_name)
+      
+      # If extraction failed, mark as "OTHER"
+      if (extracted_cell_line == sample_name) {
+        cell_line <- "OTHER"
+      } else {
+        cell_line <- extracted_cell_line
+      }
+      
+      samples[[length(samples) + 1]] <- list(
+        name = sample_name,
+        tissue_pos = tissue_pos_file,
+        hypoxia = hyp_file,
+        cell_line = cell_line
+      )
+      
+      cat(sprintf("%s (%s) - has hypoxia data\n", sample_name, cell_line))
+    } else {
+      cat(sprintf("%s - NO hypoxia data\n", sample_name))
+    }
+  } else {
+    cat(sprintf("%s - NO tissue_positions.csv\n", sample_name))
+  }
+}
+
+cat("\nTotal samples with BOTH tissue and hypoxia data:", length(samples), "\n")
+```
+
+---
+
+## Run Alignment
+
+```{r run-alignment}
+# Create sample info dataframe first (to avoid redundant reads)
+sample_info <- map_df(samples, ~ data.frame(
+  sample_name = .$name,
+  cell_line = .$cell_line,
+  stringsAsFactors = FALSE
+))
+
+# Run alignment and add sample-level metadata
+results <- map_df(samples, ~ align_spots_with_hypoxia(
+  tissue_pos_file = .$tissue_pos,
+  hypoxia_file = .$hypoxia,
+  sample_name = .$name
+)) |>
+  left_join(sample_info, by = c("sample" = "sample_name"))
+
+cat("Alignment complete\n")
+cat("Total spots:", nrow(results), "\n")
+cat("Spots with hypoxia data:", sum(!is.na(results$hypoxia_label)), "\n")
+cat("Spots missing hypoxia data:", sum(is.na(results$hypoxia_label)), "\n")
+```
+
+---
+
+## Quick Check - First 10 Rows
+
+```{r check-alignment}
+results |>
+  select(sample, cell_line, barcode, pxl_row_in_fullres, pxl_col_in_fullres, hypoxia_label, hypoxia_percentage) |>
+  head(10)
+```
+
+---
+
+## Summary Statistics
+
+```{r summary-stats}
+summary_stats <- results |>
+  group_by(cell_line, sample, hypoxia_label) |>
+  summarise(
+    n_spots = n(),
+    mean_hypoxia_pct = mean(hypoxia_percentage, na.rm = TRUE),
+    sd_hypoxia_pct = sd(hypoxia_percentage, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+summary_stats
+```
+
+---
+
+## Summary by Cell Line
+
+```{r summary-by-cellline}
+results |>
+  group_by(cell_line, hypoxia_label) |>
+  summarise(
+    n_spots = n(),
+    mean_hypoxia_pct = mean(hypoxia_percentage, na.rm = TRUE),
+    .groups = "drop"
+)
+```
+
+## Validate Alignment Quality
+
+```{r validate-join}
+# Check for duplicate pixel coordinate-sample combinations (shouldn't happen)
+duplicates <- results |>
+  group_by(pxl_row_in_fullres, pxl_col_in_fullres, sample) |>
+  summarise(n = n(), .groups = "drop") |>
+  filter(n > 1)
+
+if (nrow(duplicates) > 0) {
+  cat(" WARNING: Found", nrow(duplicates), "duplicate pixel-sample combinations\n")
+  print(duplicates)
+} else {
+  cat("Join validation: Pixel coordinates are unique per sample\n")
+}
+
+# Summary of data quality
+cat("\n=== ALIGNMENT QUALITY SUMMARY ===\n")
+cat("Total spots after alignment:", nrow(results), "\n")
+cat("Spots with hypoxia data:", sum(!is.na(results$hypoxia_label)), 
+    " (", round(100 * sum(!is.na(results$hypoxia_label)) / nrow(results), 1), "%)\n")
+cat("Spots missing hypoxia data:", sum(is.na(results$hypoxia_label)), "\n")
+
+cat("\n=== HYPOXIA CLASSIFICATION ===\n")
+cat("Hypoxic spots (label = 1):", sum(results$hypoxia_label == 1, na.rm = TRUE), "\n")
+cat("Normoxic spots (label = 0):", sum(results$hypoxia_label == 0, na.rm = TRUE), "\n")
+
+cat("\nBreakdown by sample:\n")
+results |>
+  group_by(sample) |>
+  summarise(
+    n_spots = n(),
+    n_hypoxic = sum(hypoxia_label == 1, na.rm = TRUE),
+    n_normoxic = sum(hypoxia_label == 0, na.rm = TRUE),
+    pct_hypoxic = round(100 * sum(hypoxia_label == 1, na.rm = TRUE) / sum(!is.na(hypoxia_label)), 1),
+    .groups = "drop"
+  ) |>
+  print()
+```
+
+---
+
+## Save Output
+
+```{r save-output}
+# Only save spots that have complete hypoxia data
+results_clean <- results |>
+  filter(!is.na(hypoxia_label))
+
+output_file <- "data/all_samples_aligned_hypoxia.csv"
+write_csv(results_clean, file = output_file)
+
+cat("\nSaved clean aligned data to:", output_file, "\n")
+cat("Total spots (with complete hypoxia data):", nrow(results_clean), "\n")
+cat("Cell lines:", paste(unique(results_clean$cell_line), collapse = ", "), "\n")
+cat("Samples:", n_distinct(results_clean$sample), "\n")
+```
+
+---
+
+## Data Columns
+
+The output CSV contains:
+
+| Column | Description |
+|--------|-------------|
+| `barcode` | 10X Visium spot barcode identifier |
+| `in_tissue` | Flag (0/1) for spots in tissue region |
+| `array_row`, `array_col` | Array coordinates |
+| `pxl_row_in_fullres`, `pxl_col_in_fullres` | Pixel coordinates (join key for hypoxia alignment) |
+| `sample` | Sample name |
+| `cell_line` | Cell line (FaDu, UT5, Cal33, UT8, SAS, SAT, etc.) |
+| `hypoxia_label` | Binary classification: 1 = hypoxic, 0 = normoxic |
+| `hypoxia_percentage` | % hypoxic pixels in spot (0-100) |
+| `hypoxic_pixels` | Count of hypoxic pixels |
+| `total_pixels` | Total pixels in spot (typically 1681) |
+
+**Note:** Alignment is performed using pixel coordinates (pxl_row_in_fullres, pxl_col_in_fullres) as the spatial identifier within each sample. This ensures no cross-sample contamination.
+

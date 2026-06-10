@@ -1,0 +1,469 @@
+---
+title: "Spatial Metaprograms: Foundation Data Preparation"
+subtitle: "Clean spot-level master table with MP scores for downstream spatial analysis"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 2
+    theme: cosmo
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = FALSE, fig.width = 12, fig.height = 8)
+```
+
+# Overview
+
+**File 1 Purpose:** Create a clean, one-row-per-spot master table with:
+- Spatial coordinates (barcode, pixel positions)
+- Sample and cell line metadata
+- Hypoxia classification and percentages
+- Continuous MP scores (MP1-MP4) from AddModuleScore
+- Dominant metaprogram with confidence metrics
+- Global MP composition entropy (sample-level diversity)
+
+**This is a FOUNDATION file.** Detailed spatial analysis (neighborhoods, gradients, domains, heterogeneity interpretation) happens in File 2.
+
+**Output:** 
+- `master_spot_table.csv` — one row per spot, ready for File 2
+- `mp_hypoxia_analysis_results.rds` — all objects for reference
+
+---
+
+# Section 1: Setup & Data Loading
+
+```{r load-libraries}
+library(tidyverse)
+library(Seurat)
+library(ggplot2)
+library(patchwork)
+library(readr)
+```
+
+## Load Consensus Metaprograms
+
+```{r load-metaprograms}
+# Load final consensus MP definitions
+source(here::here("config.R"))  # defines DATA_DIR, RESULTS_DIR, ANALYSIS_SUBTYPES_DIR
+analysis_subtypes_dir <- ANALYSIS_SUBTYPES_DIR
+results_dir <- file.path(analysis_subtypes_dir, "data", "parallel_results")
+out_dir <- file.path(results_dir, "integrated")
+
+metaprograms_file <- file.path(out_dir, "metaprograms_final.rds")
+if (!file.exists(metaprograms_file)) {
+  metaprograms_file <- file.path(out_dir, "metaprogram_genes.rds")
+}
+metaprograms <- readRDS(metaprograms_file)
+
+# Drop MPs with no genes
+metaprograms <- metaprograms[sapply(metaprograms, length) > 0]
+cat("Loaded", length(metaprograms), "consensus metaprograms (empty MPs removed)\n")
+cat("MP names:", names(metaprograms), "\n\n")
+
+# Show MP gene compositions
+for (mp_name in names(metaprograms)) {
+  genes <- metaprograms[[mp_name]]
+  cat(mp_name, ": ", length(genes), " genes\n")
+  cat("  ", paste(head(genes, 5), collapse=", "), "...\n\n")
+}
+```
+
+## Load Hypoxia Data
+
+```{r load-hypoxia}
+# Load hypoxia data
+hypoxia_file <- file.path(analysis_subtypes_dir, "2_METAPROGRAMS_INTEGRATION", "data", "all_samples_aligned_hypoxia.csv")
+hypoxia_data <- read_csv(hypoxia_file, show_col_types = FALSE)
+cat("Loaded hypoxia data:", nrow(hypoxia_data), "spots\n")
+```
+
+## Compute MP Scores from Seurat Objects
+
+```{r compute-mp-scores}
+# Compute MP scores directly from gene expression
+mp_score_list <- list()
+
+qc_dir <- file.path(analysis_subtypes_dir, "0_QC_AND_PREPROCESSING", "data")
+
+for (sample_name in unique(hypoxia_data$sample)) {
+  seu_file <- file.path(qc_dir, paste0(sample_name, "_qc_with_metadata.rds"))
+  if (!file.exists(seu_file)) {
+    cat("", sample_name, "- QC file not found:", seu_file, "\n")
+    next
+  }
+  
+  cat("Processing:", sample_name, "\n")
+  seu <- readRDS(seu_file)
+  
+  # Extract normalized expression matrix (Seurat v4/v5 compatible)
+  mat <- tryCatch(
+    GetAssayData(seu, assay = "Spatial", layer = "data"),
+    error = function(e) GetAssayData(seu, assay = "Spatial", slot = "data")
+  )
+
+  if (nrow(mat) == 0 || ncol(mat) == 0) {
+    cat("  Normalizing from counts...\n")
+    seu <- NormalizeData(seu, assay = "Spatial", verbose = FALSE)
+    mat <- tryCatch(
+      GetAssayData(seu, assay = "Spatial", layer = "data"),
+      error = function(e) GetAssayData(seu, assay = "Spatial", slot = "data")
+    )
+  }
+
+  # Compute mean expression of MP genes per spot
+  mp_df <- data.frame(row.names = colnames(mat))
+  for (mp_name in names(metaprograms)) {
+    mp_genes_present <- intersect(metaprograms[[mp_name]], rownames(mat))
+    if (length(mp_genes_present) > 5) {
+      mp_df[[mp_name]] <- colMeans(mat[mp_genes_present, , drop = FALSE])
+    } else {
+      mp_df[[mp_name]] <- NA_real_
+    }
+  }
+
+  mp_df$barcode <- colnames(mat)
+  mp_df$sample  <- sample_name
+  mp_score_list[[sample_name]] <- mp_df
+  cat("  Done:", nrow(mp_df), "spots,", sum(!is.na(mp_df$MP1)), "with MP1 score\n")
+}
+
+if (length(mp_score_list) == 0) {
+  stop("No QC files found. Check path: ", qc_dir)
+}
+mp_all_samples <- do.call(rbind, mp_score_list)
+rownames(mp_all_samples) <- NULL
+
+# Merge hypoxia data with MP scores
+analysis_data <- hypoxia_data |>
+  left_join(mp_all_samples, by = c("barcode", "sample")) |>
+  as.data.frame()
+
+# Verify cell_line is present (from alignment file)
+if (!"cell_line" %in% colnames(analysis_data)) {
+  stop("cell_line column not found. Check alignment file structure.")
+}
+
+# Assign dominant metaprogram + confidence scores
+mp_cols <- intersect(names(metaprograms), colnames(analysis_data))
+if(length(mp_cols) > 0) {
+  mp_matrix <- as.matrix(analysis_data[, mp_cols])
+  
+  # Top score — guard against all-NA rows (which.max returns integer(0) → apply returns list)
+  max_idx <- apply(mp_matrix, 1, function(x) {
+    idx <- which.max(x)
+    if (length(idx) == 0L) NA_integer_ else as.integer(idx)
+  })
+  analysis_data$dominant_metaprogram <- colnames(mp_matrix)[max_idx]
+  analysis_data$top_score <- apply(mp_matrix, 1, function(x) if (all(is.na(x))) NA_real_ else max(x, na.rm = TRUE))
+  
+  # Second highest score
+  second_idx <- apply(mp_matrix, 1, function(x) {
+    sorted_idx <- order(x, decreasing = TRUE)
+    if(length(sorted_idx) > 1) return(sorted_idx[2]) else return(1)
+  })
+  analysis_data$second_score <- mp_matrix[cbind(1:nrow(mp_matrix), second_idx)]
+  
+  # Dominance margin: confidence in dominant call
+  analysis_data$dominance_margin <- analysis_data$top_score - analysis_data$second_score
+}
+
+cat("Computed MP scores from Seurat objects\n")
+cat("Dimensions:", nrow(analysis_data), "spots ×", ncol(analysis_data), "variables\n")
+cat("Samples:", n_distinct(analysis_data$sample), "\n")
+cat("Cell lines:", n_distinct(analysis_data$cell_line), "\n")
+cat("Spots with MP assignment:", sum(!is.na(analysis_data$dominant_metaprogram)), "\n")
+cat("Mean dominance margin:", round(mean(analysis_data$dominance_margin, na.rm=TRUE), 3), "\n\n")
+```
+
+---
+
+# Section 2: Metaprogram Distribution
+
+## MP Presence & Abundance
+
+```{r mp-distribution}
+# For each sample: count spots per program
+mp_distribution <- analysis_data |>
+  filter(!is.na(dominant_metaprogram)) |>
+  group_by(sample) |>
+  summarize(
+    n_spots = n(),
+    mp1_count = sum(dominant_metaprogram == "MP1"),
+    mp2_count = sum(dominant_metaprogram == "MP2"),
+    mp3_count = sum(dominant_metaprogram == "MP3"),
+    mp4_count = sum(dominant_metaprogram == "MP4"),
+    mp5_count = sum(dominant_metaprogram == "MP5"),
+    mp1_pct = 100 * mp1_count / n_spots,
+    mp2_pct = 100 * mp2_count / n_spots,
+    mp3_pct = 100 * mp3_count / n_spots,
+    mp4_pct = 100 * mp4_count / n_spots,
+    mp5_pct = 100 * mp5_count / n_spots,
+    cell_line = first(cell_line),
+    .groups = "drop"
+  ) |>
+  arrange(desc(mp1_pct + mp2_pct))
+
+cat("METAPROGRAM DISTRIBUTION BY SAMPLE\n")
+cat("====================================\n\n")
+cat("Samples with complete data:", n_distinct(mp_distribution$sample), "\n")
+cat("Cell lines: ", paste(unique(mp_distribution$cell_line), collapse = ", "), "\n\n")
+print(mp_distribution |> dplyr::select(sample, n_spots, mp1_pct, mp2_pct, mp3_pct, mp4_pct, mp5_pct, cell_line))
+```
+
+## Visualization: MP Composition
+
+```{r mp-composition-plot, fig.width=14, fig.height=6}
+# Convert to long format for stacked bar plot
+mp_comp_long <- mp_distribution |>
+  dplyr::select(sample, mp1_pct, mp2_pct, mp3_pct, mp4_pct, mp5_pct) |>
+  pivot_longer(cols = starts_with("mp"), names_to = "program", values_to = "pct") |>
+  mutate(program = sub("_pct", "", program) |> toupper()) |>
+  arrange(sample)
+
+# Order samples by MP1 dominance
+sample_order <- mp_distribution |> 
+  arrange(desc(mp1_pct)) |> 
+  pull(sample)
+
+p_mp_comp <- ggplot(mp_comp_long |> mutate(sample = fct_relevel(sample, sample_order)), 
+                     aes(x = sample, y = pct, fill = program)) +
+  geom_col(alpha = 0.8) +
+  coord_flip() +
+  labs(
+    title = "Metaprogram Composition per Sample",
+    x = "Sample",
+    y = "% of Spots",
+    fill = "Program"
+  ) +
+  scale_fill_manual(values = c("MP1" = "#0072B2", "MP2" = "#E69F00", "MP3" = "#009E73", "MP4" = "#CC79A7", "MP5" = "#D55E00")) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", size = 13))
+
+p_mp_comp
+```
+
+---
+
+# Section 3: Global MP Composition Entropy
+
+## Calculate Shannon Entropy
+
+```{r shannon-entropy}
+# Shannon entropy measures how evenly distributed programs are
+# H = -Σ(p_i * ln(p_i))
+# Entropy 0 = one program (100%), Entropy ~1.39 = all equal (25% each)
+
+shannon_entropy <- function(pcts) {
+  # pcts = vector of percentages
+  probs <- pcts / sum(pcts)
+  probs <- probs[probs > 0]  # remove zeros to avoid log(0)
+  entropy <- -sum(probs * log(probs))
+  return(entropy)
+}
+
+# Calculate entropy per sample
+mp_entropy_sample <- mp_distribution |>
+  mutate(
+    global_mp_composition_entropy = mapply(function(p1, p2, p3, p4, p5) {
+      shannon_entropy(c(p1, p2, p3, p4, p5))
+    }, mp1_pct, mp2_pct, mp3_pct, mp4_pct, mp5_pct),
+    dominance_pct = pmax(mp1_pct, mp2_pct, mp3_pct, mp4_pct, mp5_pct)
+  ) |>
+  dplyr::select(sample, cell_line, n_spots, global_mp_composition_entropy, dominance_pct,
+                mp1_pct, mp2_pct, mp3_pct, mp4_pct, mp5_pct) |>
+  arrange(desc(global_mp_composition_entropy))
+
+cat("NOTE: 'global_mp_composition_entropy' is a SAMPLE-LEVEL summary\n")
+cat("   It describes how evenly MPs are distributed across the sample\n")
+cat("   SPATIAL heterogeneity (local neighborhoods) is computed in File 2\n\n")
+
+cat("GLOBAL MP COMPOSITION ENTROPY BY SAMPLE\n")
+cat("======================================\n\n")
+print(as.data.frame(mp_entropy_sample |> dplyr::select(sample, cell_line, global_mp_composition_entropy, dominance_pct, mp1_pct:mp5_pct)), digits = 2)
+
+cat("\n\nENTROPY STATISTICS\n")
+cat("Mean entropy:  ", round(mean(mp_entropy_sample$global_mp_composition_entropy), 3), "\n")
+cat("Median entropy:", round(median(mp_entropy_sample$global_mp_composition_entropy), 3), "\n")
+cat("Min entropy:   ", round(min(mp_entropy_sample$global_mp_composition_entropy), 3), " (homogeneous)\n")
+cat("Max entropy:   ", round(max(mp_entropy_sample$global_mp_composition_entropy), 3), " (diverse)\n")
+```
+
+## Visualization: Global MP Composition Entropy by Sample
+
+```{r entropy-plot, fig.width=12, fig.height=7}
+p_entropy <- ggplot(mp_entropy_sample |> mutate(sample = fct_reorder(sample, global_mp_composition_entropy)), 
+                    aes(x = sample, y = global_mp_composition_entropy, fill = cell_line)) +
+  geom_col(alpha = 0.7) +
+  geom_hline(yintercept = c(1.0, 1.2), linetype = "dashed", color = "gray40", size = 0.5) +
+  coord_flip() +
+  labs(
+    title = "Global MP Composition Entropy by Sample",
+    x = "Sample",
+    y = "Shannon Entropy",
+    fill = "Cell Line",
+    subtitle = "Sample-level diversity: how evenly are programs distributed?"
+  ) +
+  scale_fill_manual(values = c("FaDu" = "#9B59B6", "UT5" = "#E67E22", "Cal33" = "#1ABC9C", 
+                               "UT8" = "#F1C40F", "SAS" = "#4ECDC4", "SAT" = "#FF6B6B")) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", size = 13))
+
+p_entropy
+```
+
+---
+
+# Section 4: Data Quality Summary
+
+## Spot-level Completeness
+
+```{r data-quality}
+cat("SPOT-LEVEL DATA QUALITY\n")
+cat("==========================\n\n")
+
+cat("MP Score Completeness:\n")
+mp_missing <- analysis_data |>
+  summarise(
+    complete_mp1 = sum(!is.na(MP1)),
+    complete_mp2 = sum(!is.na(MP2)),
+    complete_mp3 = sum(!is.na(MP3)),
+    complete_mp4 = sum(!is.na(MP4)),
+    complete_mp5 = sum(!is.na(MP5)),
+    all_five = sum(!is.na(MP1) & !is.na(MP2) & !is.na(MP3) & !is.na(MP4) & !is.na(MP5))
+  )
+
+print(mp_missing)
+
+cat("\nDominance Confidence (dominance_margin):\n")
+cat("  Mean margin:", round(mean(analysis_data$dominance_margin, na.rm=TRUE), 3), "\n")
+cat("  Min margin: ", round(min(analysis_data$dominance_margin, na.rm=TRUE), 3), "\n")
+cat("  Max margin: ", round(max(analysis_data$dominance_margin, na.rm=TRUE), 3), "\n")
+cat("  (Higher margin = more confident MP call)\n\n")
+
+cat("Hypoxia Data:\n")
+cat("  Spots with hypoxia_label:", sum(!is.na(analysis_data$hypoxia_label)), "\n")
+cat("  Normoxic (label=0):", sum(analysis_data$hypoxia_label == 0, na.rm=TRUE), "\n")
+cat("  Hypoxic (label=1):", sum(analysis_data$hypoxia_label == 1, na.rm=TRUE), "\n")
+```
+
+## One Row Per Spot Verification
+
+```{r spot-uniqueness}
+# Verify exactly one row per barcode per sample
+spot_counts <- analysis_data |>
+  group_by(sample, barcode) |>
+  summarise(n = n(), .groups = "drop") |>
+  filter(n > 1)
+
+if(nrow(spot_counts) > 0) {
+  cat(" WARNING: Found", nrow(spot_counts), "barcodes with multiple rows\n")
+  print(spot_counts)
+} else {
+  cat("Each barcode appears exactly once per sample\n")
+  cat("   Total unique spots:", n_distinct(analysis_data$barcode), "\n")
+  cat("   Across", n_distinct(analysis_data$sample), "samples\n")
+}
+```
+
+---
+
+# Section 5: Save Master Spot Table & Results
+
+## Create Master Spot Table (One row per spot)
+
+```{r create-master-table}
+# Debug: confirm which MP columns are in analysis_data
+mp_present <- intersect(c("MP1","MP2","MP3","MP4","MP5"), colnames(analysis_data))
+cat("MP columns in analysis_data:", paste(mp_present, collapse=", "), "\n")
+if (length(mp_present) < 5) warning("Not all 5 MPs present — check score computation above")
+
+# Use any_of so missing columns don't cause error
+master_spot_table <- analysis_data |>
+  dplyr::select(any_of(c(
+    # Metadata
+    "sample", "barcode", "cell_line",
+    # Spatial coordinates
+    "pxl_row_in_fullres", "pxl_col_in_fullres",
+    "array_row", "array_col",
+    # Hypoxia classification
+    "hypoxia_label", "hypoxia_percentage",
+    # MP scores (continuous)
+    "MP1", "MP2", "MP3", "MP4", "MP5",
+    # Dominance metrics
+    "dominant_metaprogram", "top_score", "second_score", "dominance_margin"
+  ))) |>
+  arrange(sample, barcode)
+
+# Merge pathologist annotations if available (resolve file, with fallback)
+annot_file <- file.path(analysis_subtypes_dir, "3_CELL_TYPE_ANNOTATION", "results",
+                         "pathologist_labels_all_samples.csv")
+if (!file.exists(annot_file)) {
+  annot_file <- file.path(ANALYSIS_SUBTYPES_DIR, "3_CELL_TYPE_ANNOTATION/results/pathologist_labels_all_samples.csv")
+}
+if (file.exists(annot_file)) {
+  cat("Merging pathologist annotations...\n")
+  annot <- read_csv(annot_file, show_col_types = FALSE) |>
+    rename(barcode = spot) |>
+    dplyr::select(barcode, sample, pathologist_label)
+  master_spot_table <- master_spot_table |>
+    left_join(annot, by = c("barcode", "sample"))
+  cat("  Annotation coverage:", sum(!is.na(master_spot_table$pathologist_label)),
+      "of", nrow(master_spot_table), "spots\n")
+  cat("  Labels:", paste(sort(unique(master_spot_table$pathologist_label)), collapse=", "), "\n")
+} else {
+  cat("No pathologist annotations found — run 3_CELL_TYPE_ANNOTATION/1_assign_pathologist_labels.R first\n")
+  master_spot_table$pathologist_label <- NA_character_
+}
+
+cat("\nMASTER SPOT TABLE CREATED\n")
+cat("============================\n\n")
+cat("Dimensions:", nrow(master_spot_table), "spots ×", ncol(master_spot_table), "columns\n")
+cat("Columns:", paste(colnames(master_spot_table), collapse=", "), "\n")
+```
+
+## Save Master Spot Table as CSV
+
+```{r save-master-table}
+output_dir <- file.path(analysis_subtypes_dir, "2_METAPROGRAMS_INTEGRATION", "data")
+dir.create(output_dir, showWarnings = FALSE)
+
+master_file <- file.path(output_dir, "master_spot_table.csv")
+write_csv(master_spot_table, master_file)
+
+cat("\nSaved master spot table:\n")
+cat(master_file, "\n\n")
+cat("This table is ready for File 2 (spatial analysis)\n")
+cat("Each row is one unique spot with all essential data\n")
+```
+
+## Save All Objects to RDS (for reference)
+
+```{r save-rds}
+# Bundle all analysis results into a single list
+analysis_results <- list(
+  master_spot_table = master_spot_table,
+  analysis_data = analysis_data,
+  metaprograms = metaprograms,
+  mp_distribution = mp_distribution,
+  mp_entropy_sample = mp_entropy_sample
+)
+
+results_file <- file.path(output_dir, "mp_hypoxia_analysis_results.rds")
+saveRDS(analysis_results, results_file)
+
+cat("\nAll results saved to:\n")
+cat(results_file, "\n\n")
+cat("Objects saved for reference:\n")
+cat("  - master_spot_table: one-row-per-spot master data (also saved as CSV)\n")
+cat("  - analysis_data: full spot-level data with all variables\n")
+cat("  - metaprograms: MP gene definitions\n")
+cat("  - mp_distribution: MP counts/percentages per sample\n")
+cat("  - mp_entropy_sample: global MP composition entropy (sample-level)\n\n")
+cat("To load in File 2:\n")
+cat("  results <- readRDS('mp_hypoxia_analysis_results.rds')\n")
+cat("  master_spot_table <- results$master_spot_table\n")
+cat("  # OR directly from CSV:\n")
+cat("  master_spot_table <- read_csv('master_spot_table.csv')\n")
+```
+

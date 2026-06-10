@@ -1,0 +1,619 @@
+---
+title: "Tumor Metaprogram Integration - Intra-Sample Heterogeneity Analysis"
+author: "Metaprogram pipeline adapted from Greenwald et al. (Tirosh lab)"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 10, fig.height = 8)
+```
+
+# Overview
+
+This notebook integrates NMF programs from all hypoxia samples following the **Tirosh/Gronewald methodology**:
+
+1. Load all NMF programs from all samples
+2. Filter programs to Leiden cluster marker genes (Tirosh approach)
+3. Filter for robust programs (intra-sample overlap ≥ 20 genes)
+4. Calculate Jaccard similarities
+5. Greedy clustering (threshold = 0.1)
+6. Define consensus metaprograms
+
+---
+
+# Setup
+
+```{r libraries}
+library(dplyr)
+library(ggplot2)
+library(reshape2)
+library(pheatmap)
+library(RColorBrewer)
+```
+
+```{r directories}
+# Hardcoded absolute paths — dirname(getwd()) is unreliable during render
+source(here::here("config.R"))  # defines DATA_DIR, RESULTS_DIR, ANALYSIS_SUBTYPES_DIR
+results_dir <- file.path(ANALYSIS_SUBTYPES_DIR, "data/parallel_results")
+
+qc_dir <- file.path(ANALYSIS_SUBTYPES_DIR, "0_QC_AND_PREPROCESSING/data")
+
+out_dir <- file.path(results_dir, "integrated")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+cat("Results directory:", results_dir, "\n")
+cat("QC directory:     ", qc_dir, "\n")
+cat("Output directory: ", out_dir, "\n")
+```
+
+---
+
+# Step 1: Load All NMF Programs
+
+Programs are already ranked by NMF loading strength from the per-sample analysis.
+
+```{r load-programs}
+cat("=== Loading NMF programs (pre-ranked by NMF loading) ===\n\n")
+
+sample_dirs <- list.dirs(results_dir, recursive = FALSE, full.names = TRUE)
+sample_dirs <- sample_dirs[!grepl("integrated", sample_dirs)]
+
+cat("Found", length(sample_dirs), "sample directories\n\n")
+
+all_programs <- list()
+
+for (sdir in sample_dirs) {
+  sample_name <- basename(sdir)
+  nmf_file <- file.path(sdir, "nmf", "all_programs.rds")
+  
+  if (file.exists(nmf_file)) {
+    cat("Loading:", sample_name, "\n")
+    programs <- readRDS(nmf_file)
+    for (prog_name in names(programs)) {
+      all_programs[[prog_name]] <- programs[[prog_name]]
+    }
+  } else {
+    cat("Missing:", sample_name, "\n")
+  }
+}
+
+cat("\nTotal programs loaded:", length(all_programs), "\n")
+cat("   (Each program's genes are already ranked by NMF loading)\n")
+```
+
+```{r save-all-programs}
+saveRDS(all_programs, file.path(out_dir, "all_programs_combined.rds"))
+```
+
+---
+
+# Step 1.5: Extract Leiden Cluster Markers (Tirosh Approach)
+
+```{r extract-markers}
+cat("=== Extracting cluster markers from Leiden results ===\n\n")
+
+all_markers_combined <- list()
+
+for (sdir in sample_dirs) {
+  sample_name <- basename(sdir)
+  deg_file <- file.path(sdir, "leiden", "deg_results.csv")
+
+  if (!file.exists(deg_file)) {
+    cat("No DEG results for:", sample_name, "\n")
+    next
+  }
+
+  cat("Processing:", sample_name, "\n")
+  markers <- read.csv(deg_file, stringsAsFactors = FALSE)
+
+  # Get top 50 markers per cluster by avg_log2FC
+  top_markers <- markers %>%
+    group_by(cluster) %>%
+    top_n(n = 50, wt = avg_log2FC) %>%
+    pull(gene) %>%
+    unique()
+
+  all_markers_combined[[sample_name]] <- top_markers
+  cat("  Found", length(top_markers), "unique marker genes\n")
+}
+
+cat("\nExtracted markers from", length(all_markers_combined), "samples\n")
+saveRDS(all_markers_combined, file.path(out_dir, "leiden_marker_genes.rds"))
+```
+
+---
+
+# Step 1.6: Filter NMF Programs to Marker Genes Only (Tirosh)
+
+```{r filter-to-markers}
+cat("=== Filtering NMF programs to Leiden marker genes ===\n\n")
+
+all_markers_combined <- readRDS(file.path(out_dir, "leiden_marker_genes.rds"))
+
+filtered_programs <- list()
+
+for (prog_name in names(all_programs)) {
+  sample_name <- sub("\\..*", "", prog_name)
+
+  if (!sample_name %in% names(all_markers_combined)) {
+    cat("No markers for", sample_name, "- keeping original program\n")
+    filtered_programs[[prog_name]] <- all_programs[[prog_name]]
+    next
+  }
+
+  sample_markers <- all_markers_combined[[sample_name]]
+  prog_genes     <- all_programs[[prog_name]]
+  marker_genes   <- intersect(prog_genes, sample_markers)
+
+  if (length(marker_genes) >= 10) {
+    filtered_programs[[prog_name]] <- marker_genes
+  }
+}
+
+cat("\nPrograms before filtering:", length(all_programs), "\n")
+cat("Programs after filtering: ", length(filtered_programs), "\n")
+cat("Average genes per program (before):",
+    round(mean(sapply(all_programs, length)), 1), "\n")
+cat("Average genes per program (after): ",
+    round(mean(sapply(filtered_programs, length)), 1), "\n\n")
+
+filtered_per_sample <- table(sub("\\..*", "", names(filtered_programs)))
+print(filtered_per_sample)
+cat("Total programs after filtering:", length(filtered_programs), "\n")
+
+all_programs <- filtered_programs
+saveRDS(all_programs, file.path(out_dir, "all_programs_marker_filtered.rds"))
+```
+
+---
+
+# Step 2: Filter for Robust Programs
+
+Following **Tirosh criteria**: Programs must overlap with at least one other program from the **same sample** by ≥ 20 genes.
+
+```{r robust-filtering}
+cat("=== Filtering for robust programs ===\n\n")
+
+intra_min <- 20
+
+# Group by sample
+programs_by_sample <- list()
+for (prog_name in names(all_programs)) {
+  sname <- sub("\\..*", "", prog_name)
+  if (!sname %in% names(programs_by_sample)) programs_by_sample[[sname]] <- list()
+  programs_by_sample[[sname]][[prog_name]] <- all_programs[[prog_name]]
+}
+
+cat("Samples with programs:", length(programs_by_sample), "\n\n")
+
+# Diagnostic: program sizes
+cat("Program sizes after marker filtering:\n")
+print(summary(sapply(all_programs, length)))
+cat("\n")
+
+robust_programs <- list()
+
+for (sname in names(programs_by_sample)) {
+  sample_progs <- programs_by_sample[[sname]]
+  n_progs      <- length(sample_progs)
+  cat("Sample:", sname, "- Programs:", n_progs, "\n")
+
+  sample_robust <- 0
+
+  for (i in seq_along(sample_progs)) {
+    prog_name  <- names(sample_progs)[i]
+    prog_genes <- sample_progs[[i]]
+
+    max_overlap <- 0
+    for (j in seq_along(sample_progs)) {
+      if (i != j) {
+        overlap <- length(intersect(prog_genes, sample_progs[[j]]))
+        if (overlap > max_overlap) max_overlap <- overlap
+      }
+    }
+
+    if (max_overlap >= intra_min) {
+      robust_programs[[prog_name]] <- prog_genes
+      sample_robust <- sample_robust + 1
+    }
+  }
+
+  cat("  → Robust:", sample_robust, "/", n_progs,
+      "(", round(100 * sample_robust / n_progs, 1), "%)\n")
+}
+
+cat("\nTotal robust programs:", length(robust_programs), "/", length(all_programs), "\n")
+cat("   Overall filter rate:", round(100 * length(robust_programs) / length(all_programs), 1), "%\n")
+
+# Fallback: if threshold too strict, use all filtered programs
+if (length(robust_programs) == 0) {
+  cat("\n No programs passed robustness filter — using all marker-filtered programs as fallback\n")
+  robust_programs <- all_programs
+}
+```
+
+```{r save-robust}
+saveRDS(robust_programs, file.path(out_dir, "robust_programs.rds"))
+```
+
+---
+
+# Step 3: Calculate Jaccard Similarity
+
+```{r jaccard-similarity}
+cat("=== Calculating Jaccard similarity ===\n\n")
+
+n_progs    <- length(robust_programs)
+jaccard_mat <- matrix(0, nrow = n_progs, ncol = n_progs)
+rownames(jaccard_mat) <- names(robust_programs)
+colnames(jaccard_mat) <- names(robust_programs)
+
+for (i in seq_len(n_progs)) {
+  for (j in i:n_progs) {
+    intersection <- length(intersect(robust_programs[[i]], robust_programs[[j]]))
+    union_len    <- length(union(robust_programs[[i]], robust_programs[[j]]))
+    jac          <- if (union_len == 0) 0 else intersection / union_len
+
+    jaccard_mat[i, j] <- jac
+    jaccard_mat[j, i] <- jac
+  }
+
+  if (i %% 50 == 0) cat("  Progress:", i, "/", n_progs, "\n")
+}
+
+cat("\nJaccard statistics:\n")
+upper_tri <- jaccard_mat[upper.tri(jaccard_mat)]
+cat("   Mean:         ", round(mean(upper_tri), 3), "\n")
+cat("   Median:       ", round(median(upper_tri), 3), "\n")
+if (any(upper_tri < 1)) {
+  cat("   Max (non-self):", round(max(upper_tri[upper_tri < 1]), 3), "\n")
+}
+```
+
+```{r save-jaccard}
+saveRDS(jaccard_mat, file.path(out_dir, "jaccard_matrix.rds"))
+```
+
+---
+
+# Step 4: Greedy Clustering
+
+Programs with Jaccard ≥ 0.1 are grouped into the same metaprogram.
+
+```{r greedy-clustering}
+cat("=== Greedy clustering ===\n\n")
+
+threshold       <- 0.1
+clusters        <- rep(0, n_progs)
+current_cluster <- 1
+
+for (i in seq_len(n_progs)) {
+  if (clusters[i] == 0) {
+    clusters[i]    <- current_cluster
+    similar_progs  <- which(jaccard_mat[i, ] >= threshold & clusters == 0)
+    if (length(similar_progs) > 0) clusters[similar_progs] <- current_cluster
+    current_cluster <- current_cluster + 1
+  }
+}
+
+n_metaprograms <- max(clusters)
+cat("Total metaprograms:", n_metaprograms, "\n\n")
+
+cluster_sizes <- table(clusters)
+cat("Cluster size distribution:\n")
+print(summary(as.numeric(cluster_sizes)))
+```
+
+---
+
+# Step 5: Define Metaprogram Consensus Genes (Frequency × Rank-Weighted)
+
+```{r consensus-genes-rank-weighted}
+cat("=== Defining consensus genes with frequency × rank weighting ===\n\n")
+
+metaprograms <- list()
+
+for (clust_id in unique(clusters)) {
+  prog_indices       <- which(clusters == clust_id)
+  n_progs_in_cluster <- length(prog_indices)
+
+  all_genes_in_cluster <- unlist(robust_programs[prog_indices])
+  gene_freq            <- table(all_genes_in_cluster)
+
+  min_freq       <- max(3, ceiling(n_progs_in_cluster * 0.25))
+  consensus_genes <- names(gene_freq)[gene_freq >= min_freq]
+
+  gene_ranks       <- setNames(rep(NA, length(consensus_genes)), consensus_genes)
+  gene_rank_counts <- setNames(rep(0,  length(consensus_genes)), consensus_genes)
+
+  for (prog_idx in prog_indices) {
+    prog_genes <- robust_programs[[prog_idx]]
+    for (rank_pos in seq_along(prog_genes)) {
+      gene <- prog_genes[rank_pos]
+      if (gene %in% consensus_genes) {
+        gene_ranks[gene]       <- if (is.na(gene_ranks[gene])) rank_pos else gene_ranks[gene] + rank_pos
+        gene_rank_counts[gene] <- gene_rank_counts[gene] + 1
+      }
+    }
+  }
+
+  gene_ranks             <- gene_ranks / gene_rank_counts
+  consensus_genes_sorted <- names(sort(gene_ranks[consensus_genes]))
+  top_genes              <- head(consensus_genes_sorted, 50)
+  mp_name                <- paste0("MP", clust_id)
+  metaprograms[[mp_name]] <- top_genes
+
+  cat(sprintf("%-6s: %3d programs → %2d genes (min_freq=%d, rank-weighted)\n",
+              mp_name, n_progs_in_cluster, length(top_genes), min_freq))
+}
+
+cat("\nMetaprograms created:", length(metaprograms), "\n")
+```
+
+```{r save-metaprograms}
+saveRDS(metaprograms, file.path(out_dir, "metaprogram_genes.rds"))
+```
+
+---
+
+# Step 5.1: Extract Signature Genes (Top 5 per Metaprogram)
+
+```{r signature-genes}
+cat("=== Extracting signature genes (top 5 per metaprogram) ===\n\n")
+
+signature_genes <- list()
+for (mp_name in names(metaprograms)) {
+  top_5 <- head(metaprograms[[mp_name]], 5)
+  signature_genes[[mp_name]] <- top_5
+  cat(sprintf("%-6s signature genes: %s\n", mp_name, paste(top_5, collapse = ", ")))
+}
+
+cat("\nSignature genes extracted:", length(signature_genes), "\n")
+saveRDS(signature_genes, file.path(out_dir, "metaprogram_signature_genes.rds"))
+
+sig_df <- data.frame(
+  Metaprogram = rep(names(signature_genes), sapply(signature_genes, length)),
+  Rank        = unlist(lapply(signature_genes, function(x) seq_along(x))),
+  Gene        = unlist(signature_genes)
+)
+write.csv(sig_df, file.path(out_dir, "metaprogram_signature_genes.csv"), row.names = FALSE)
+cat("   Saved: metaprogram_signature_genes.csv\n")
+```
+
+---
+
+# Step 5.5: Filter Empty/Small Metaprograms
+
+```{r filter-empty}
+cat("=== Filtering out empty/small metaprograms ===\n\n")
+
+min_genes    <- 10
+min_programs <- 5
+
+valid_metaprograms <- list()
+valid_clusters     <- c()
+
+for (mp_name in names(metaprograms)) {
+  n_genes   <- length(metaprograms[[mp_name]])
+  clust_id  <- as.numeric(sub("MP", "", mp_name))
+  n_programs <- sum(clusters == clust_id)
+
+  if (n_genes >= min_genes && n_programs >= min_programs) {
+    valid_metaprograms[[mp_name]] <- metaprograms[[mp_name]]
+    valid_clusters <- c(valid_clusters, clust_id)
+  } else {
+    cat("Removing", mp_name, "- Programs:", n_programs, "| Genes:", n_genes, "\n")
+  }
+}
+
+cat("\nValid metaprograms:", length(valid_metaprograms), "/", length(metaprograms), "\n\n")
+
+metaprograms_final <- list()
+for (i in seq_along(valid_metaprograms)) {
+  metaprograms_final[[paste0("MP", i)]] <- valid_metaprograms[[i]]
+}
+metaprograms <- metaprograms_final
+
+saveRDS(metaprograms, file.path(out_dir, "metaprograms_final.rds"))
+cat("Saved metaprograms_final.rds:", length(metaprograms), "MPs (", paste(names(metaprograms), collapse=", "), ")\n")
+```
+
+---
+
+# Step 6: Summary Table
+
+```{r summary-table}
+summary_list <- list()
+
+for (mp_name in names(metaprograms)) {
+  original_mp_name <- names(valid_metaprograms)[which(names(metaprograms) == mp_name)]
+  clust_id <- as.numeric(sub("MP", "", original_mp_name))
+
+  summary_list[[mp_name]] <- data.frame(
+    metaprogram = mp_name,
+    n_programs  = sum(clusters == clust_id),
+    n_genes     = length(metaprograms[[mp_name]])
+  )
+}
+
+summary_df <- do.call(rbind, summary_list)
+rownames(summary_df) <- NULL
+summary_df <- summary_df %>% arrange(desc(n_programs))
+knitr::kable(summary_df, caption = "Metaprogram Summary")
+```
+
+```{r save-summary}
+write.csv(summary_df, file.path(out_dir, "metaprogram_summary.csv"), row.names = FALSE)
+```
+
+---
+
+# Visualization: Jaccard Heatmap
+
+```{r jaccard-heatmap, fig.width=12, fig.height=10}
+cluster_order  <- order(clusters)
+jaccard_ordered <- jaccard_mat[cluster_order, cluster_order]
+
+jac_melt              <- melt(jaccard_ordered)
+jac_melt$value_capped <- pmin(jac_melt$value, 0.35)
+
+ggplot(jac_melt, aes(x = Var1, y = Var2, fill = value_capped)) +
+  geom_tile() +
+  scale_fill_gradient2(
+    low = "white", mid = "yellow", high = "red",
+    midpoint = 0.175, limits = c(0, 0.35),
+    name = "Jaccard\nSimilarity"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x  = element_blank(),
+    axis.text.y  = element_blank(),
+    axis.title   = element_blank(),
+    axis.ticks   = element_blank(),
+    panel.grid   = element_blank()
+  ) +
+  ggtitle("Hypoxia Metaprograms - Program Similarity (Ordered by Clusters)")
+```
+
+```{r save-heatmap}
+ggsave(filename = file.path(out_dir, "jaccard_heatmap.pdf"), width = 12, height = 10)
+```
+
+---
+
+# Top Genes per Metaprogram
+
+```{r top-genes}
+for (mp_name in names(metaprograms)) {
+  cat("\n###", mp_name, "\n\n")
+  cat(paste(head(metaprograms[[mp_name]], 20), collapse = ", "), "\n")
+}
+```
+
+---
+
+# Generate Sample × Metaprogram Counts
+
+Score metaprograms on each sample and count spot assignments.
+
+```{r generate-sample-mp-counts}
+cat("=== Generating sample × metaprogram counts ===\n\n")
+
+library(Seurat)
+
+sample_mp_counts <- list()
+sample_dirs_mp   <- list.dirs(results_dir, recursive = FALSE, full.names = TRUE)
+sample_dirs_mp   <- sample_dirs_mp[!grepl("integrated|ipynb", basename(sample_dirs_mp))]
+
+for (sdir in sample_dirs_mp) {
+  sample_name <- basename(sdir)
+  seu_file    <- file.path(qc_dir, paste0(sample_name, "_qc_with_metadata.rds"))
+
+  if (!file.exists(seu_file)) {
+    cat("Skipping", sample_name, "- no QC Seurat object\n")
+    next
+  }
+
+  cat("Processing:", sample_name, "\n")
+  seu <- readRDS(seu_file)
+  seu <- NormalizeData(seu, assay = "Spatial", normalization.method = "LogNormalize",
+                       verbose = FALSE)
+
+  mp_scores           <- matrix(NA, nrow = ncol(seu), ncol = length(metaprograms))
+  colnames(mp_scores) <- names(metaprograms)
+  rownames(mp_scores) <- colnames(seu)
+
+  for (mp_idx in seq_along(metaprograms)) {
+    mp_name          <- names(metaprograms)[mp_idx]
+    mp_genes_present <- metaprograms[[mp_name]][metaprograms[[mp_name]] %in% rownames(seu)]
+
+    if (length(mp_genes_present) >= 5) {
+      set.seed(42 + mp_idx)
+      seu <- AddModuleScore(seu, features = list(mp_genes_present),
+                            name = paste0("MP", mp_idx), ctrl = 50)
+      score_col <- paste0("MP", mp_idx, "1")
+      mp_scores[, mp_idx] <- seu@meta.data[[score_col]]
+    }
+  }
+
+  dominant_mp <- apply(mp_scores, 1, function(x) {
+    if (all(is.na(x))) return(NA)
+    names(metaprograms)[which.max(x)]
+  })
+
+  mp_table <- data.frame(
+    metaprogram = names(table(dominant_mp)),
+    count       = as.numeric(table(dominant_mp))
+  )
+
+  sample_mp_counts[[sample_name]] <- mp_table
+  cat("  → Assigned", sum(!is.na(dominant_mp)), "spots to",
+      length(unique(dominant_mp[!is.na(dominant_mp)])), "metaprograms\n")
+}
+
+cat("\nProcessed", length(sample_mp_counts), "samples\n")
+saveRDS(sample_mp_counts, file.path(out_dir, "sample_mp_counts.rds"))
+cat("   Saved to: sample_mp_counts.rds\n")
+```
+
+---
+
+# Heatmap: Metaprogram Presence Across Samples
+
+```{r mp-heatmap, fig.width=12, fig.height=8}
+heatmap_data <- matrix(0, nrow = length(sample_mp_counts), ncol = length(metaprograms))
+rownames(heatmap_data) <- names(sample_mp_counts)
+colnames(heatmap_data) <- names(metaprograms)
+
+for (sample in names(sample_mp_counts)) {
+  for (mp in names(metaprograms)) {
+    count <- sample_mp_counts[[sample]]$count[sample_mp_counts[[sample]]$metaprogram == mp]
+    if (length(count) > 0) heatmap_data[sample, mp] <- count
+  }
+}
+
+pheatmap(
+  heatmap_data,
+  color          = colorRampPalette(c("white", "yellow", "orange", "red"))(50),
+  cluster_rows   = TRUE,
+  cluster_cols   = TRUE,
+  show_rownames  = TRUE,
+  show_colnames  = TRUE,
+  fontsize_row   = 8,
+  fontsize_col   = 8,
+  border_color   = "gray",
+  main           = "Metaprogram Contribution Across Samples",
+  angle_col      = 90
+)
+```
+
+```{r save-heatmap-presence}
+pdf(file.path(out_dir, "mp_presence_heatmap.pdf"), width = 12, height = 8)
+pheatmap(
+  heatmap_data,
+  color        = colorRampPalette(c("white", "yellow", "orange", "red"))(50),
+  cluster_rows = TRUE, cluster_cols = TRUE,
+  show_rownames = TRUE, show_colnames = TRUE,
+  fontsize_row = 8, fontsize_col = 8,
+  border_color = "gray",
+  main = "Metaprogram Contribution Across Samples",
+  angle_col = 90
+)
+dev.off()
+```
+
+---
+
+# Spatial Visualizations (Downstream)
+
+```{r spatial-note}
+cat("Spatial visualization handled in downstream analysis:\n")
+cat("  → 4_METAPROGRAMS_SPATIAL_ANALYSIS/\n")
+cat("Outputs saved to:", out_dir, "\n")
+```
+

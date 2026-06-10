@@ -1,0 +1,59 @@
+# R session / state
+.Rproj.user/
+.Rhistory
+.Rapp.history
+.RData
+.Ruserdata
+*.Rproj
+
+# Rendered outputs
+*.html
+*_cache/
+*_files/
+
+# Raw / external data — do not commit (set DATA_DIR in config.R)
+data/*
+!data/README.md
+!data/.gitkeep
+
+# Generated results / figures — regenerated locally
+results/*
+!results/.gitkeep
+Writing/
+
+# Heavy bioinformatics artefacts
+*.rds
+*.RDS
+*.rda
+*.h5
+*.h5ad
+*.loom
+*.mtx
+*.csv
+*.tsv
+*.xlsx
+*.pdf
+*.pptx
+*.png
+*.jpg
+*.svg
+
+# Keep gene-set reference files (public signatures)
+!**/gmt_files/*.gmt
+
+# Notebook / editor scratch
+.ipynb_checkpoints/
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Cluster job logs
+logs/
+*.out
+*.err
+
+# Temp
+*.tmp
+*.swp
+*~

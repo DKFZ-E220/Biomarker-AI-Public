@@ -1,0 +1,404 @@
+---
+title: "1. QC and Data Preparation - Concatenation vs Integration Comparison"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+## Load Libraries
+
+```{r setup, message=FALSE, warning=FALSE}
+library(Seurat)
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+library(tibble)
+
+# Memory monitoring
+check_memory <- function(stage = "") {
+  mem_info <- gc()
+  used_mb <- (mem_info[1, 2] * 8) / (1024^2)  # Convert to MB
+  cat("Memory usage", stage, ":", round(used_mb, 1), "MB\n")
+  return(used_mb)
+}
+
+# Create output directories (local to QC folder)
+dir.create("data", recursive = TRUE, showWarnings = FALSE)
+dir.create("figures", recursive = TRUE, showWarnings = FALSE)
+
+cat("=== QC AND DATA PREPARATION ===\n")
+initial_memory <- check_memory("at start")
+```
+
+## Load Spatial Data
+
+```{r load-data}
+# Data loading
+# Visium SpaceRanger sample outputs (path configured in config.R)
+source(here::here("config.R"))  # defines DATA_DIR, RESULTS_DIR, ANALYSIS_SUBTYPES_DIR
+data_dir <- file.path(DATA_DIR, "SPT/samples_3.3.1")
+
+# Grab every "outs/" directory one level down
+all_dirs  <- list.dirs(data_dir, full.names = TRUE, recursive = 1)
+outs_dirs <- all_dirs[basename(all_dirs) == "outs"]
+
+# Keep only valid Visium directories
+valid_outs <- Filter(function(d) {
+  has_h5   <- file.exists(file.path(d, "filtered_feature_bc_matrix.h5"))
+  has_dir  <- dir.exists(file.path(d, "filtered_feature_bc_matrix"))
+  has_spat <- dir.exists(file.path(d, "spatial"))
+  (has_h5 || has_dir) && has_spat
+}, outs_dirs)
+
+if (length(valid_outs) == 0) {
+  stop("No valid Visium 'outs/' directories found in ", data_dir)
+}
+
+cat("Found", length(valid_outs), "valid Visium folders\n")
+
+# Smart loader function (from original QC script)
+fix_spatial_scales_safe <- function(outs_path) {
+  tryCatch({
+    # Pick the right filename argument
+    if (file.exists(file.path(outs_path, "filtered_feature_bc_matrix.h5"))) {
+      so <- Load10X_Spatial(outs_path, filename = "filtered_feature_bc_matrix.h5")
+    } else {
+      so <- Load10X_Spatial(outs_path, filename = "filtered_feature_bc_matrix")
+    }
+    
+    # Fix any spatial coordinate scaling issues
+    if ("spatial" %in% names(so@images)) {
+      scale_factors <- so@images$spatial@scale.factors
+      if (is.null(scale_factors$tissue_hires_scalef) || scale_factors$tissue_hires_scalef == 0) {
+        so@images$spatial@scale.factors$tissue_hires_scalef <- 0.1
+      }
+      if (is.null(scale_factors$tissue_lowres_scalef) || scale_factors$tissue_lowres_scalef == 0) {
+        so@images$spatial@scale.factors$tissue_lowres_scalef <- 0.05
+      }
+    }
+    
+    return(so)
+  }, error = function(e) {
+    cat("Error loading", outs_path, ":", e$message, "\n")
+    return(NULL)
+  })
+}
+
+# Load all samples
+seurat_list <- list()
+for (outs_path in valid_outs) {
+  sample_name <- basename(dirname(outs_path))
+  cat("Loading sample:", sample_name, "\n")
+  
+  so <- fix_spatial_scales_safe(outs_path)
+  
+  if (!is.null(so)) {
+  
+  # Add sample metadata
+  so$sample_id <- sample_name
+  so$orig.ident <- sample_name
+  
+  # Extract cell line using SAME pattern as integration script
+  extracted_cell_line <- gsub(".*_(FaDu|UT5|Cal33|UT8|SAS|UT45|SAT).*", "\\1", sample_name)
+  
+  # If extraction failed, mark as "Unknown" instead of using the full sample name
+  if (extracted_cell_line == sample_name) {
+    cat(" Cell line extraction failed for:", sample_name, "\n")
+    so$cell_line <- "Unknown"
+  } else {
+    so$cell_line <- extracted_cell_line
+  }
+  
+  # NO TREATMENT INFO - this is just spatial transcriptomics data from different cell lines
+  # "SPT" likely means "Spatial" not a treatment
+  
+  seurat_list[[sample_name]] <- so
+  }
+}
+
+# Remove any NULL entries
+seurat_list <- Filter(Negate(is.null), seurat_list)
+
+# DIAGNOSTIC: Check all cell lines detected during loading
+all_cell_lines_detected <- sapply(seurat_list, function(so) unique(so$cell_line)[1])
+cat("\n=== CELL LINE EXTRACTION DIAGNOSTIC ===\n")
+cat("Total samples loaded:", length(seurat_list), "\n")
+for(i in seq_along(seurat_list)) {
+  sample_name <- names(seurat_list)[i]
+  cell_line <- all_cell_lines_detected[i]
+  cat("Sample:", sample_name, "→ Cell line:", cell_line, "\n")
+}
+cat("Unique cell lines detected:", paste(unique(all_cell_lines_detected), collapse = ", "), "\n")
+cat("Number of unique cell lines:", length(unique(all_cell_lines_detected)), "\n")
+
+cat("Loaded", length(seurat_list), "samples successfully\n")
+check_memory("after loading samples")
+```
+
+
+## QC Metrics Analysis
+
+```{r qc-metrics, fig.width=15, fig.height=12}
+# Calculate comprehensive QC metrics
+cat("=== CALCULATING QC METRICS ===\n")
+
+# Patterns for gene types
+mt_patterns <- c("^MT-", "^mt-", "^Mt-", "MITO", "mito")
+ribo_patterns <- c("^RPS", "^RPL", "^rps", "^rpl")
+
+for (i in seq_along(seurat_list)) {
+  sample_name <- names(seurat_list)[i]
+  so <- seurat_list[[sample_name]]
+  
+  cat("Processing QC for:", sample_name, "\n")
+  
+  # Check for mitochondrial genes
+  mt_found <- FALSE
+  for (pattern in mt_patterns) {
+    mt_genes <- grep(pattern, rownames(so), value = TRUE)
+    if (length(mt_genes) > 0) {
+      so <- PercentageFeatureSet(so, pattern = pattern, col.name = "percent_mt")
+      mt_found <- TRUE
+      break
+    }
+  }
+  if (!mt_found) {
+    so$percent_mt <- 0
+    cat("  No mitochondrial genes found\n")
+  }
+  
+  # Check for ribosomal genes
+  ribo_found <- FALSE
+  for (pattern in ribo_patterns) {
+    ribo_genes <- grep(pattern, rownames(so), value = TRUE)
+    if (length(ribo_genes) > 0) {
+      so <- PercentageFeatureSet(so, pattern = pattern, col.name = "percent_ribo")
+      ribo_found <- TRUE
+      break
+    }
+  }
+  if (!ribo_found) {
+    so$percent_ribo <- 0
+    cat("  No ribosomal genes found\n")
+  }
+  
+  # Additional QC metrics
+  so$log10_nCount <- log10(so$nCount_Spatial + 1)
+  so$log10_nFeature <- log10(so$nFeature_Spatial + 1)
+  
+  seurat_list[[sample_name]] <- so
+}
+
+# Create comprehensive QC plots
+qc_metrics <- c("nCount_Spatial", "nFeature_Spatial", "percent_mt", "percent_ribo")
+
+# Plot 1: Individual sample QC distributions
+qc_plots_individual <- list()
+for (metric in qc_metrics) {
+  plots_per_metric <- list()
+  
+  for (i in seq_len(min(6, length(seurat_list)))) {  # Show first 6 samples
+    sample_name <- names(seurat_list)[i]
+    so <- seurat_list[[sample_name]]
+    
+    if (metric %in% colnames(so@meta.data)) {
+      p <- VlnPlot(so, features = metric, pt.size = 0.1) +
+        ggtitle(paste(sample_name, metric)) +
+        theme(axis.text.x = element_blank(),
+              axis.title.x = element_blank())
+      plots_per_metric[[sample_name]] <- p
+    }
+  }
+  
+  if (length(plots_per_metric) > 0) {
+    combined_plot <- wrap_plots(plots_per_metric, ncol = 3)
+    qc_plots_individual[[metric]] <- combined_plot
+  }
+}
+
+# Display individual QC plots
+for (metric in names(qc_plots_individual)) {
+  print(qc_plots_individual[[metric]])
+}
+```
+
+## Combined QC Summary
+
+```{r qc-summary, fig.width=16, fig.height=10}
+# Combine metadata from all samples
+combined_metadata <- do.call(rbind, lapply(names(seurat_list), function(sample_name) {
+  so <- seurat_list[[sample_name]]
+  data.frame(
+    sample_id = sample_name,
+    cell_line = so$cell_line,
+    nCount_Spatial = so$nCount_Spatial,
+    nFeature_Spatial = so$nFeature_Spatial,
+    percent_mt = so$percent_mt,
+    percent_ribo = so$percent_ribo,
+    stringsAsFactors = FALSE
+  )
+}))
+
+# QC summary statistics
+cat("=== QC SUMMARY STATISTICS ===\n")
+qc_summary <- combined_metadata %>%
+  group_by(cell_line) %>%
+  summarise(
+    n_spots = n(),
+    mean_UMI = round(mean(nCount_Spatial)),
+    median_UMI = round(median(nCount_Spatial)),
+    mean_genes = round(mean(nFeature_Spatial)),
+    median_genes = round(median(nFeature_Spatial)),
+    mean_mt = round(mean(percent_mt), 2),
+    mean_ribo = round(mean(percent_ribo), 2),
+    .groups = 'drop'
+  )
+
+print(qc_summary)
+
+# Comprehensive QC visualization
+p1 <- ggplot(combined_metadata, aes(x = cell_line, y = nCount_Spatial, fill = cell_line)) +
+  geom_violin(alpha = 0.7) +
+  geom_boxplot(width = 0.1, alpha = 0.5) +
+  scale_y_log10() +
+  labs(title = "UMI Counts by Cell Line", 
+       y = "UMI Count (log10)", x = "Cell Line") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p2 <- ggplot(combined_metadata, aes(x = cell_line, y = nFeature_Spatial, fill = cell_line)) +
+  geom_violin(alpha = 0.7) +
+  geom_boxplot(width = 0.1, alpha = 0.5) +
+  scale_y_log10() +
+  labs(title = "Gene Count by Cell Line",
+       y = "Gene Count (log10)", x = "Cell Line") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p3 <- ggplot(combined_metadata, aes(x = nCount_Spatial, y = nFeature_Spatial, color = cell_line)) +
+  geom_point(alpha = 0.6, size = 0.8) +
+  scale_x_log10() + scale_y_log10() +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(title = "UMI vs Gene Count Correlation",
+       x = "UMI Count (log10)", y = "Gene Count (log10)") +
+  theme_minimal()
+
+p4 <- ggplot(combined_metadata, aes(x = cell_line, fill = cell_line)) +
+  geom_bar() +
+  labs(title = "Sample Distribution by Cell Line",
+       y = "Number of Spots", x = "Cell Line") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Combine all QC plots
+combined_qc_plot <- (p1 | p2) / (p3 | p4)
+print(combined_qc_plot)
+
+# Save QC plot
+ggsave("figures/01_comprehensive_qc_analysis.pdf", combined_qc_plot, 
+       width = 16, height = 10, dpi = 300)
+```
+
+## Filtering Assessment
+
+```{r filtering-assessment, fig.width=14, fig.height=8}
+cat("=== FILTERING ASSESSMENT ===\n")
+
+# Assess potential filtering thresholds
+filtering_stats <- combined_metadata %>%
+  summarise(
+    total_spots = n(),
+    low_umi_100 = sum(nCount_Spatial < 100),
+    low_umi_200 = sum(nCount_Spatial < 200),
+    low_genes_50 = sum(nFeature_Spatial < 50),
+    low_genes_100 = sum(nFeature_Spatial < 100),
+    high_umi_q99 = sum(nCount_Spatial > quantile(nCount_Spatial, 0.99)),
+    high_genes_q99 = sum(nFeature_Spatial > quantile(nFeature_Spatial, 0.99))
+  )
+
+cat("Filtering assessment:\n")
+cat("Total spots:", filtering_stats$total_spots, "\n")
+cat("Spots with <100 UMIs:", filtering_stats$low_umi_100, 
+    "(", round(filtering_stats$low_umi_100/filtering_stats$total_spots*100, 1), "%)\n")
+cat("Spots with <200 UMIs:", filtering_stats$low_umi_200,
+    "(", round(filtering_stats$low_umi_200/filtering_stats$total_spots*100, 1), "%)\n")
+cat("Spots with <50 genes:", filtering_stats$low_genes_50,
+    "(", round(filtering_stats$low_genes_50/filtering_stats$total_spots*100, 1), "%)\n")
+cat("Spots with <100 genes:", filtering_stats$low_genes_100,
+    "(", round(filtering_stats$low_genes_100/filtering_stats$total_spots*100, 1), "%)\n")
+
+# Filtering recommendation
+if (filtering_stats$low_umi_100/filtering_stats$total_spots > 0.05) {
+  cat("RECOMMEND FILTERING: >5% spots have very low UMIs\n")
+  recommended_filter <- "nCount_Spatial > 100"
+} else if (filtering_stats$low_genes_50/filtering_stats$total_spots > 0.05) {
+  cat("CONSIDER FILTERING: >5% spots have very low gene counts\n")
+  recommended_filter <- "nFeature_Spatial > 50"
+} else {
+  cat("NO FILTERING NEEDED: Most spots have reasonable expression\n")
+  recommended_filter <- "none"
+}
+
+# Filtering visualization
+p_filter1 <- ggplot(combined_metadata, aes(x = nCount_Spatial)) +
+  geom_histogram(bins = 50, alpha = 0.7, fill = "steelblue") +
+  geom_vline(xintercept = 100, color = "red", linetype = "dashed") +
+  geom_vline(xintercept = 200, color = "orange", linetype = "dashed") +
+  scale_x_log10() +
+  labs(title = "UMI Count Distribution", x = "UMI Count (log10)", y = "Frequency") +
+  theme_minimal()
+
+p_filter2 <- ggplot(combined_metadata, aes(x = nFeature_Spatial)) +
+  geom_histogram(bins = 50, alpha = 0.7, fill = "forestgreen") +
+  geom_vline(xintercept = 50, color = "red", linetype = "dashed") +
+  geom_vline(xintercept = 100, color = "orange", linetype = "dashed") +
+  scale_x_log10() +
+  labs(title = "Gene Count Distribution", x = "Gene Count (log10)", y = "Frequency") +
+  theme_minimal()
+
+filtering_plot <- p_filter1 | p_filter2
+print(filtering_plot)
+
+ggsave("figures/02_filtering_assessment.pdf", filtering_plot, 
+       width = 14, height = 6, dpi = 300)
+```
+
+## Save Processed Data
+
+```{r save-data}
+cat("=== SAVING PROCESSED DATA ===\n")
+
+# Save individual samples with metadata
+for (sample_name in names(seurat_list)) {
+  saveRDS(seurat_list[[sample_name]], 
+          file = paste0("data/", sample_name, "_qc_with_metadata.rds"))
+}
+
+# Save QC summary
+saveRDS(combined_metadata, "data/qc_metadata_summary.rds")
+saveRDS(qc_summary, "data/qc_statistics_summary.rds")
+
+# Save filtering recommendation
+writeLines(recommended_filter, "data/filtering_recommendation.txt")
+
+cat("Saved QC data and metadata\n")
+cat("Recommended filtering:", recommended_filter, "\n")
+
+final_memory <- check_memory("at end")
+cat("Memory change:", round(final_memory - initial_memory, 1), "MB\n")
+```
+
+## Summary
+
+**QC Analysis Complete:**
+
+- Loaded `r length(seurat_list)` spatial samples
+- Calculated comprehensive QC metrics
+- Assessed mitochondrial/ribosomal gene content
+- Generated filtering recommendations
+- Created visualization plots
+- Saved processed data for comparison analysis
+
+**Next Steps:**
+1. Run Script 2A (Concatenation approach)
+2. Run Script 2B (Integration approach)  
+3. Compare results from both methods
