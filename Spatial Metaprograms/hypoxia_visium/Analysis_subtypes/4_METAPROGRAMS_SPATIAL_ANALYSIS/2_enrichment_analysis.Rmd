@@ -70,7 +70,7 @@ mp_labels <- c(
   MP1 = "MP1 — EMT/Mesenchymal",
   MP2 = "MP2 — Hypoxia Response",
   MP3 = "MP3 — Squamous Differentiation",
-  MP4 = "MP4 — Fibroblast/Stromal",
+  MP4 = "MP4 — ECM/Stromal",
   MP5 = "MP5 — Keratinocyte/Basal"
 )
 

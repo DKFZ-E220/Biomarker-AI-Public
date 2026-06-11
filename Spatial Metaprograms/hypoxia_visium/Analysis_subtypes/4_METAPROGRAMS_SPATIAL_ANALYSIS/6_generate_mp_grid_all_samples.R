@@ -32,7 +32,7 @@ wong_mp <- c(
   MP1 = "#0072B2",   # Blue       — EMT/Mesenchymal
   MP2 = "#E69F00",   # Orange     — Hypoxia Response
   MP3 = "#009E73",   # Green      — Squamous Differentiation
-  MP4 = "#CC79A7",   # Mauve      — Fibroblast/Stromal
+  MP4 = "#CC79A7",   # Mauve      — ECM/Stromal
   MP5 = "#D55E00"    # Vermillion — Keratinocyte/Basal
 )
 
@@ -122,7 +122,7 @@ p_grid <- ggplot(composition,
       MP1 = "MP1 — EMT/Mesenchymal",
       MP2 = "MP2 — Hypoxia Response",
       MP3 = "MP3 — Squamous Differentiation",
-      MP4 = "MP4 — Fibroblast/Stromal",
+      MP4 = "MP4 — ECM/Stromal",
       MP5 = "MP5 — Keratinocyte/Basal"
     )
   ) +
@@ -182,7 +182,7 @@ p_bar <- ggplot(composition_bar,
       MP1 = "MP1 — EMT/Mesenchymal",
       MP2 = "MP2 — Hypoxia Response",
       MP3 = "MP3 — Squamous Differentiation",
-      MP4 = "MP4 — Fibroblast/Stromal",
+      MP4 = "MP4 — ECM/Stromal",
       MP5 = "MP5 — Keratinocyte/Basal"
     )
   ) +

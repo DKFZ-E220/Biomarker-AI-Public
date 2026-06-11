@@ -43,14 +43,14 @@ mp_colors <- c(
   MP1 = "#0072B2",   # EMT/Mesenchymal
   MP2 = "#E69F00",   # Hypoxia Response
   MP3 = "#009E73",   # Squamous Differentiation
-  MP4 = "#CC79A7",   # Fibroblast/Stromal
+  MP4 = "#CC79A7",   # ECM/Stromal
   MP5 = "#D55E00"    # Keratinocyte/Basal
 )
 mp_labels <- c(
   MP1 = "MP1 \u2014 EMT/Mesenchymal",
   MP2 = "MP2 \u2014 Hypoxia Response",
   MP3 = "MP3 \u2014 Squamous Differentiation",
-  MP4 = "MP4 \u2014 Fibroblast/Stromal",
+  MP4 = "MP4 \u2014 ECM/Stromal",
   MP5 = "MP5 \u2014 Keratinocyte/Basal"
 )
 

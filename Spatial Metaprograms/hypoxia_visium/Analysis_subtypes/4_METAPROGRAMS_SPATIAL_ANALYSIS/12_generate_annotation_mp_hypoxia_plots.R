@@ -67,14 +67,14 @@ mp_colors <- c(
   MP1 = "#0072B2",  # EMT/Mesenchymal
   MP2 = "#E69F00",  # Hypoxia Response
   MP3 = "#009E73",  # Squamous Differentiation
-  MP4 = "#CC79A7",  # Fibroblast/Stromal
+  MP4 = "#CC79A7",  # ECM/Stromal
   MP5 = "#D55E00"   # Keratinocyte/Basal
 )
 mp_labels <- c(
   MP1 = "MP1\nEMT/Mesen.",
   MP2 = "MP2\nHypoxia",
   MP3 = "MP3\nSquamous",
-  MP4 = "MP4\nFibroblast",
+  MP4 = "MP4\nECM/Stromal",
   MP5 = "MP5\nKeratinocyte"
 )
 hypoxia_colors <- c("Hypoxic" = "#D55E00", "Normoxic" = "#0072B2")
@@ -154,7 +154,7 @@ p1 <- ggplot(mp_long, aes(x = pathologist_label, y = score, fill = mp)) +
                position = position_dodge(width = 0.8), linewidth = 0.3) +
   scale_fill_manual(values = mp_colors, name = "Metaprogram",
                     labels = c(MP1="MP1 EMT", MP2="MP2 Hypoxia",
-                               MP3="MP3 Squamous", MP4="MP4 Fibroblast", MP5="MP5 Keratinocyte")) +
+                               MP3="MP3 Squamous", MP4="MP4 ECM/Stromal", MP5="MP5 Keratinocyte")) +
   facet_wrap(~ mp, ncol = 5, labeller = labeller(mp = mp_labels)) +
   labs(title = "Metaprogram Score Distribution by Tissue Type",
        subtitle = "H&E pathologist annotation vs NMF metaprogram scores",
@@ -216,7 +216,7 @@ p3 <- ggplot(mp_per_tissue, aes(x = pathologist_label, y = pct,
   geom_col(color = "black", linewidth = 0.3) +
   scale_fill_manual(values = mp_colors, name = "Dominant MP",
                     labels = c(MP1="MP1 EMT/Mesen.", MP2="MP2 Hypoxia",
-                               MP3="MP3 Squamous", MP4="MP4 Fibroblast",
+                               MP3="MP3 Squamous", MP4="MP4 ECM/Stromal",
                                MP5="MP5 Keratinocyte")) +
   scale_y_continuous(labels = scales::percent_format(scale = 1)) +
   labs(title = "Metaprogram Composition Within Each Tissue Type",
@@ -246,7 +246,7 @@ p4 <- ggplot(tissue_per_mp, aes(x = dominant_metaprogram, y = pct,
   geom_col(color = "black", linewidth = 0.3) +
   scale_fill_manual(values = annot_colors, name = "Tissue Type") +
   scale_x_discrete(labels = c(MP1="MP1\nEMT", MP2="MP2\nHypoxia",
-                               MP3="MP3\nSquamous", MP4="MP4\nFibroblast",
+                               MP3="MP3\nSquamous", MP4="MP4\nECM/Stromal",
                                MP5="MP5\nKeratinocyte")) +
   scale_y_continuous(labels = scales::percent_format(scale = 1)) +
   labs(title = "Tissue Type Composition Within Each Dominant Metaprogram",
@@ -290,7 +290,7 @@ pheatmap(
   border_color  = "white",
   angle_col     = 45,
   labels_col    = c("MP1\nEMT", "MP2\nHypoxia", "MP3\nSquamous",
-                    "MP4\nFibroblast", "MP5\nKeratinocyte")
+                    "MP4\nECM/Stromal", "MP5\nKeratinocyte")
 )
 dev.off()
 cat("  MP_Heatmap_Tissue_Hypoxia.pdf\n")

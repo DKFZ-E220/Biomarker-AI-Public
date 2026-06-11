@@ -217,7 +217,7 @@ p_heatmap <- ggplot(contrib_counts,
       MP1 = "MP1\nEMT/Mesen.",
       MP2 = "MP2\nHypoxia",
       MP3 = "MP3\nSquamous Diff.",
-      MP4 = "MP4\nFibroblast",
+      MP4 = "MP4\nECM/Stromal",
       MP5 = "MP5\nKeratinocyte"
     )
   ) +
@@ -266,7 +266,7 @@ scores_long <- spots %>%
       mp == "MP1" ~ "MP1 — EMT/Mesenchymal",
       mp == "MP2" ~ "MP2 — Hypoxia Response",
       mp == "MP3" ~ "MP3 — Squamous Differentiation",
-      mp == "MP4" ~ "MP4 — Fibroblast/Stromal",
+      mp == "MP4" ~ "MP4 — ECM/Stromal",
       mp == "MP5" ~ "MP5 — Keratinocyte/Basal"
     )
   )
