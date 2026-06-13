@@ -137,7 +137,7 @@ for (cell_line in all_cell_lines) {
     
     # Create boxplot: MP × Hypoxia Status
     mp_order <- c("MP1", "MP2", "MP3", "MP4", "MP5")
-    mp_labels <- c("MP1\n(EMT/Mesenchymal)", "MP2\n(Hypoxia Response)", "MP3\n(Squamous Diff.)", "MP4\n(ECM/Stromal)", "MP5\n(Keratinocyte/Basal)")
+    mp_labels <- c("MP1\n(EMT/Mesenchymal)", "MP2\n(Hypoxia Response)", "MP3\n(Squamous Diff.)", "MP4\n(ECM/Stromal)", "MP5\n(Keratinocyte/Squamous-epithelial)")
     mp_colors <- c("MP1" = "#0072B2", "MP2" = "#E69F00", "MP3" = "#009E73", "MP4" = "#CC79A7", "MP5" = "#D55E00")
 
     p_boxplot <- ggplot(cell_line_data, aes(x = Metaprogram, y = Score, fill = hypoxia_status)) +

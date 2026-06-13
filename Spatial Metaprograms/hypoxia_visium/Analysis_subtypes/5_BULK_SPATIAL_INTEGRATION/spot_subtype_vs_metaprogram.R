@@ -55,7 +55,7 @@ mp_colors <- c(
   MP2 = "#E69F00",   # Hypoxia Response
   MP3 = "#009E73",   # Squamous Differentiation
   MP4 = "#CC79A7",   # ECM/Stromal
-  MP5 = "#D55E00"    # Keratinocyte/Basal
+  MP5 = "#D55E00"    # Keratinocyte/Squamous-epithelial
 )
 
 mp_labels <- c(
@@ -63,7 +63,7 @@ mp_labels <- c(
   MP2 = "MP2 — Hypoxia Response",
   MP3 = "MP3 — Squamous Diff.",
   MP4 = "MP4 — ECM/Stromal",
-  MP5 = "MP5 — Keratinocyte/Basal"
+  MP5 = "MP5 — Keratinocyte/Squamous-epithelial"
 )
 
 # ==============================================================================

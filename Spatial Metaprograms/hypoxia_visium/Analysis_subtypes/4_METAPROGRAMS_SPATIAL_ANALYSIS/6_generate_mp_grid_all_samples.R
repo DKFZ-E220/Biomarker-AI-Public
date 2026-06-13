@@ -33,7 +33,7 @@ wong_mp <- c(
   MP2 = "#E69F00",   # Orange     — Hypoxia Response
   MP3 = "#009E73",   # Green      — Squamous Differentiation
   MP4 = "#CC79A7",   # Mauve      — ECM/Stromal
-  MP5 = "#D55E00"    # Vermillion — Keratinocyte/Basal
+  MP5 = "#D55E00"    # Vermillion — Keratinocyte/Squamous-epithelial
 )
 
 wong_cellline <- c(
@@ -123,7 +123,7 @@ p_grid <- ggplot(composition,
       MP2 = "MP2 — Hypoxia Response",
       MP3 = "MP3 — Squamous Differentiation",
       MP4 = "MP4 — ECM/Stromal",
-      MP5 = "MP5 — Keratinocyte/Basal"
+      MP5 = "MP5 — Keratinocyte/Squamous-epithelial"
     )
   ) +
   facet_wrap(~ label, ncol = 4) +
@@ -183,7 +183,7 @@ p_bar <- ggplot(composition_bar,
       MP2 = "MP2 — Hypoxia Response",
       MP3 = "MP3 — Squamous Differentiation",
       MP4 = "MP4 — ECM/Stromal",
-      MP5 = "MP5 — Keratinocyte/Basal"
+      MP5 = "MP5 — Keratinocyte/Squamous-epithelial"
     )
   ) +
   # Vertical dividers between cell lines

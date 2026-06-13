@@ -22,7 +22,7 @@ mp_labels <- c(
   MP2 = "MP2 — Hypoxia Response",
   MP3 = "MP3 — Squamous Differentiation",
   MP4 = "MP4 — ECM/Stromal",
-  MP5 = "MP5 — Keratinocyte/Basal"
+  MP5 = "MP5 — Keratinocyte/Squamous-epithelial"
 )
 
 # Short labels for axis text / legends

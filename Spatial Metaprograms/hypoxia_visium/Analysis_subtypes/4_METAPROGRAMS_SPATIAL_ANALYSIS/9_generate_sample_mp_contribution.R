@@ -267,7 +267,7 @@ scores_long <- spots %>%
       mp == "MP2" ~ "MP2 — Hypoxia Response",
       mp == "MP3" ~ "MP3 — Squamous Differentiation",
       mp == "MP4" ~ "MP4 — ECM/Stromal",
-      mp == "MP5" ~ "MP5 — Keratinocyte/Basal"
+      mp == "MP5" ~ "MP5 — Keratinocyte/Squamous-epithelial"
     )
   )
 

@@ -157,7 +157,7 @@ generate_sample_spatial_plot <- function(sample_name, master_data, mp_scales) {
     MP2 = list(color = "#E69F00", label = "MP2 — Hypoxia Response"),
     MP3 = list(color = "#009E73", label = "MP3 — Squamous Diff."),
     MP4 = list(color = "#CC79A7", label = "MP4 — ECM/Stromal"),
-    MP5 = list(color = "#D55E00", label = "MP5 — Keratinocyte/Basal")
+    MP5 = list(color = "#D55E00", label = "MP5 — Keratinocyte/Squamous-epithelial")
   )
   for (i in seq_along(mp_info)) {
     mp  <- names(mp_info)[i]

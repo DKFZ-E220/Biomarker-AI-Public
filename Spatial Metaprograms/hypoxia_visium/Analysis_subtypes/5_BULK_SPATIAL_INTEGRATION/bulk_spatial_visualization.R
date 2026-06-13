@@ -42,7 +42,7 @@ mp_colors <- c(
   MP2 = "#E69F00",   # Orange     — Hypoxia Response
   MP3 = "#009E73",   # Green      — Squamous Differentiation
   MP4 = "#CC79A7",   # Mauve      — ECM/Stromal
-  MP5 = "#D55E00"    # Vermillion — Keratinocyte/Basal
+  MP5 = "#D55E00"    # Vermillion — Keratinocyte/Squamous-epithelial
 )
 
 mp_labels_full <- c(
@@ -50,7 +50,7 @@ mp_labels_full <- c(
   MP2 = "MP2\nHypoxia Response",
   MP3 = "MP3\nSquamous Diff.",
   MP4 = "MP4\nECM/Stromal",
-  MP5 = "MP5\nKeratinocyte/Basal"
+  MP5 = "MP5\nKeratinocyte/Squamous-epithelial"
 )
 
 # Subtype colours
@@ -141,7 +141,7 @@ fig1 <- ggplot(mp_long, aes(x = Sample, y = Pct, fill = MP)) +
                                "MP2 - Hypoxia Response",
                                "MP3 - Squamous Diff.",
                                "MP4 - ECM/Stromal",
-                               "MP5 - Keratinocyte/Basal"),
+                               "MP5 - Keratinocyte/Squamous-epithelial"),
                     name = "Metaprogram") +
   scale_colour_manual(values = subtype_colors) +
   scale_y_continuous(limits = c(0, 112), breaks = c(0, 25, 50, 75, 100),
