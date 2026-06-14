@@ -108,8 +108,7 @@ for (outs_path in valid_outs) {
     so$cell_line <- extracted_cell_line
   }
   
-  # NO TREATMENT INFO - this is just spatial transcriptomics data from different cell lines
-  # "SPT" likely means "Spatial" not a treatment
+  
   
   seurat_list[[sample_name]] <- so
   }
@@ -387,18 +386,4 @@ final_memory <- check_memory("at end")
 cat("Memory change:", round(final_memory - initial_memory, 1), "MB\n")
 ```
 
-## Summary
 
-**QC Analysis Complete:**
-
-- Loaded `r length(seurat_list)` spatial samples
-- Calculated comprehensive QC metrics
-- Assessed mitochondrial/ribosomal gene content
-- Generated filtering recommendations
-- Created visualization plots
-- Saved processed data for comparison analysis
-
-**Next Steps:**
-1. Run Script 2A (Concatenation approach)
-2. Run Script 2B (Integration approach)  
-3. Compare results from both methods

@@ -1,4 +1,4 @@
----
+s---
 title: "Spatial Metaprograms: Foundation Data Preparation"
 subtitle: "Clean spot-level master table with MP scores for downstream spatial analysis"
 output: 
@@ -243,74 +243,7 @@ p_mp_comp <- ggplot(mp_comp_long |> mutate(sample = fct_relevel(sample, sample_o
 p_mp_comp
 ```
 
----
 
-# Section 3: Global MP Composition Entropy
-
-## Calculate Shannon Entropy
-
-```{r shannon-entropy}
-# Shannon entropy measures how evenly distributed programs are
-# H = -Σ(p_i * ln(p_i))
-# Entropy 0 = one program (100%), Entropy ~1.39 = all equal (25% each)
-
-shannon_entropy <- function(pcts) {
-  # pcts = vector of percentages
-  probs <- pcts / sum(pcts)
-  probs <- probs[probs > 0]  # remove zeros to avoid log(0)
-  entropy <- -sum(probs * log(probs))
-  return(entropy)
-}
-
-# Calculate entropy per sample
-mp_entropy_sample <- mp_distribution |>
-  mutate(
-    global_mp_composition_entropy = mapply(function(p1, p2, p3, p4, p5) {
-      shannon_entropy(c(p1, p2, p3, p4, p5))
-    }, mp1_pct, mp2_pct, mp3_pct, mp4_pct, mp5_pct),
-    dominance_pct = pmax(mp1_pct, mp2_pct, mp3_pct, mp4_pct, mp5_pct)
-  ) |>
-  dplyr::select(sample, cell_line, n_spots, global_mp_composition_entropy, dominance_pct,
-                mp1_pct, mp2_pct, mp3_pct, mp4_pct, mp5_pct) |>
-  arrange(desc(global_mp_composition_entropy))
-
-cat("NOTE: 'global_mp_composition_entropy' is a SAMPLE-LEVEL summary\n")
-cat("   It describes how evenly MPs are distributed across the sample\n")
-cat("   SPATIAL heterogeneity (local neighborhoods) is computed in File 2\n\n")
-
-cat("GLOBAL MP COMPOSITION ENTROPY BY SAMPLE\n")
-cat("======================================\n\n")
-print(as.data.frame(mp_entropy_sample |> dplyr::select(sample, cell_line, global_mp_composition_entropy, dominance_pct, mp1_pct:mp5_pct)), digits = 2)
-
-cat("\n\nENTROPY STATISTICS\n")
-cat("Mean entropy:  ", round(mean(mp_entropy_sample$global_mp_composition_entropy), 3), "\n")
-cat("Median entropy:", round(median(mp_entropy_sample$global_mp_composition_entropy), 3), "\n")
-cat("Min entropy:   ", round(min(mp_entropy_sample$global_mp_composition_entropy), 3), " (homogeneous)\n")
-cat("Max entropy:   ", round(max(mp_entropy_sample$global_mp_composition_entropy), 3), " (diverse)\n")
-```
-
-## Visualization: Global MP Composition Entropy by Sample
-
-```{r entropy-plot, fig.width=12, fig.height=7}
-p_entropy <- ggplot(mp_entropy_sample |> mutate(sample = fct_reorder(sample, global_mp_composition_entropy)), 
-                    aes(x = sample, y = global_mp_composition_entropy, fill = cell_line)) +
-  geom_col(alpha = 0.7) +
-  geom_hline(yintercept = c(1.0, 1.2), linetype = "dashed", color = "gray40", size = 0.5) +
-  coord_flip() +
-  labs(
-    title = "Global MP Composition Entropy by Sample",
-    x = "Sample",
-    y = "Shannon Entropy",
-    fill = "Cell Line",
-    subtitle = "Sample-level diversity: how evenly are programs distributed?"
-  ) +
-  scale_fill_manual(values = c("FaDu" = "#9B59B6", "UT5" = "#E67E22", "Cal33" = "#1ABC9C", 
-                               "UT8" = "#F1C40F", "SAS" = "#4ECDC4", "SAT" = "#FF6B6B")) +
-  theme_minimal() +
-  theme(plot.title = element_text(face = "bold", size = 13))
-
-p_entropy
-```
 
 ---
 

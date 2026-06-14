@@ -77,9 +77,7 @@ sample_map <- c(
 # ==============================================================================
 # AREA-BASED MAJORITY ASSIGNMENT PARAMETERS
 # ------------------------------------------------------------------------------
-# 
-# Each Visium spot (55 µm diameter) is modelled as a circle. Pixel size in
-# this dataset: 1 px = 0.353 µm → spot radius = 27.5 µm / 0.353 µm·px⁻¹ ≈ 77.9 px.
+
 # For every spot we compute the intersection area with each QuPath annotation
 # polygon. A label is assigned only when ≥ 70 % of the spot circle falls
 # within that tissue class; otherwise the spot is labelled "Ambiguous".

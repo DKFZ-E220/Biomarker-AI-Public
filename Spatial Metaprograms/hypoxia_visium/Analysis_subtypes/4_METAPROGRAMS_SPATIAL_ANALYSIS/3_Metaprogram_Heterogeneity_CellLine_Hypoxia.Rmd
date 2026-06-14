@@ -1,7 +1,7 @@
 ---
 title: "Metaprogram Heterogeneity: Cell Line × Hypoxia Analysis"
 subtitle: "Intra and Inter-cell Line Heterogeneity in Spatial Metaprogram Organization"
-author: "PhD Analysis"
+
 date: "`r Sys.Date()`"
 output:
   html_document:
@@ -19,7 +19,7 @@ knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width =
 Using NMF loading-weighted metaprograms to show:
 1. **Inter-cell line heterogeneity**: Different cell lines have distinct MP composition patterns
 2. **Intra-cell line heterogeneity**: Hypoxia modulates MP distribution within cell lines
-3. **MP association with hypoxia**: MP1/MP4 show strong correlation with hypoxia genes (from GSEA)
+
 
 ---
 

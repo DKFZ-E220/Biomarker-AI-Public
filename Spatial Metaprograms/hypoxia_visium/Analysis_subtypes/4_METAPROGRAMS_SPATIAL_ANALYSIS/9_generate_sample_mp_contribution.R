@@ -14,26 +14,6 @@ analysis_subtypes_dir <- if (grepl("4_METAPROGRAMS_SPATIAL_ANALYSIS", getwd(), f
 # ==============================================================================
 # Figure: Sample NMF Contribution to Metaprograms
 # ==============================================================================
-# PURPOSE:
-#   Show WHICH samples actually contributed NMF programs to the consensus MPs,
-#   versus samples that only received module scores projected from other samples.
-#   These are biologically different: contributors shaped the MP definition;
-#   non-contributors are evaluated against a program they didn't help create.
-#
-# APPROACH:
-#   1. Load all_programs_marker_filtered.rds — program names encode sample source
-#      (format: {sample_name}.{prog_id})
-#   2. Assign each program to best-matching MP via Jaccard similarity to
-#      metaprograms_final.rds gene sets
-#   3. Count programs contributed per sample × MP
-#   4. Cross with master_spot_table.csv module scores to show:
-#      — Panel A: Contribution heatmap (n_programs per sample × MP)
-#      — Panel B: Module score comparison contributors vs non-contributors
-#
-# OUTPUTS:
-#   Writing/Sample_MP_Contribution_Heatmap.pdf
-#   Writing/Sample_MP_Contribution_Score_Comparison.pdf
-# ==============================================================================
 
 library(tidyverse)
 library(ggplot2)
